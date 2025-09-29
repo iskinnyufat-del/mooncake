@@ -16,12 +16,19 @@ from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# Solana
+# Solana client / tx
 from solana.rpc.api import Client
 from solana.rpc.types import TxOpts
 from solana.transaction import Transaction
-from solana.publickey import PublicKey
-from solana.keypair import Keypair
+
+# --- 兼容导入：Keypair 保持用 solana.keypair；PublicKey 在 0.30+ moved to solders ---
+from solana.keypair import Keypair  # 仍然存在于 0.30.x
+try:
+    # solana < 0.30
+    from solana.publickey import PublicKey  # type: ignore
+except Exception:
+    # solana >= 0.30 使用 solders
+    from solders.pubkey import Pubkey as PublicKey  # type: ignore
 
 # SPL Token helpers（随 solana 包提供，无需单独安装 spl-token CLI）
 from spl.token.instructions import (
@@ -30,7 +37,7 @@ from spl.token.instructions import (
     transfer_checked,
 )
 
-# Base58 兜底（有些版本没有 Keypair.from_base58_string）
+# Base58 兜底（部分版本没有 Keypair.from_base58_string）
 import base58
 
 load_dotenv()
@@ -85,6 +92,14 @@ db = firestore.client()
 # -------------------------
 client = Client(RPC_ENDPOINT)
 
+def _keypair_from_secret_bytes(secret_bytes: bytes) -> Keypair:
+    # 主要路径：solana.keypair.Keypair.from_secret_key
+    try:
+        return Keypair.from_secret_key(secret_bytes)
+    except Exception as e:
+        # 极端兜底（通常不会走到）
+        raise RuntimeError(f"Invalid secret key bytes: {e}")
+
 def _load_keypair(secret: str) -> Keypair:
     if not secret:
         raise RuntimeError("SOLANA_TREASURY_SECRET_KEY not set")
@@ -92,19 +107,12 @@ def _load_keypair(secret: str) -> Keypair:
     try:
         arr = json.loads(secret)
         if isinstance(arr, list):
-            return Keypair.from_secret_key(bytes(arr))
+            return _keypair_from_secret_bytes(bytes(arr))
     except json.JSONDecodeError:
         pass
     # 否则当作 Base58 私钥
-    try:
-        # 新版 solana-py 可能带有 from_base58_string
-        if hasattr(Keypair, "from_base58_string"):
-            return Keypair.from_base58_string(secret)
-    except Exception:
-        pass
-    # 手动 base58 解码
     raw = base58.b58decode(secret)
-    return Keypair.from_secret_key(raw)
+    return _keypair_from_secret_bytes(raw)
 
 treasury_kp = _load_keypair(TREASURY_SECRET)
 TREASURY_PUB = treasury_kp.public_key
@@ -180,7 +188,7 @@ def _ensure_ata(owner: PublicKey, mint: PublicKey, payer: Keypair) -> PublicKey:
     resp = client.get_account_info(ata)
     if resp.get("result", {}).get("value") is None:
         tx = Transaction()
-        # ✅ 参数顺序：payer_pubkey（支付租金）、owner（目标账户拥有者）、mint
+        # 参数顺序：payer_pubkey（支付租金）、owner（目标账户拥有者）、mint
         tx.add(create_associated_token_account(payer.public_key, owner, mint))
         res = client.send_transaction(tx, payer, opts=TxOpts(skip_preflight=False))
         sig = res.get("result")
@@ -283,4 +291,6 @@ def run_batch():
 if __name__ == "__main__":
     # 在 Render 会注入 PORT 环境变量；本地可直接 python app.py 运行
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
+
 
