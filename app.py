@@ -23,12 +23,15 @@ from solana.transaction import Transaction
 from solana.publickey import PublicKey
 from solana.keypair import Keypair
 
-# SPL Token helpers（该模块随 solana 包提供，无需额外安装 spl-token）
+# SPL Token helpers（随 solana 包提供，无需单独安装 spl-token CLI）
 from spl.token.instructions import (
     get_associated_token_address,
     create_associated_token_account,
     transfer_checked,
 )
+
+# Base58 兜底（有些版本没有 Keypair.from_base58_string）
+import base58
 
 load_dotenv()
 
@@ -36,8 +39,7 @@ load_dotenv()
 # Flask & CORS
 # -------------------------
 app = Flask(__name__)
-# 如需严格白名单，把 origins 改成 ["https://你的前端域名"]
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app, resources={r"/*": {"origins": os.getenv("CORS_ORIGINS", "*").split(",")}})
 
 # -------------------------
 # Required Config (via env)
@@ -50,7 +52,7 @@ RPC_ENDPOINT = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
 MINT_ADDRESS = os.getenv("SPL_MINT", "")        # 例如:  So11111111111111111111111111111111111111112
 MINT_DECIMALS = int(os.getenv("SPL_DECIMALS", "6"))
 
-# 金库私钥（Phantom 导出的 Base58 私钥 或 64 字节 JSON 数组）
+# 金库私钥（Phantom 导出的 Base58 私钥 或 64 字节 JSON 数组字符串）
 TREASURY_SECRET = os.getenv("SOLANA_TREASURY_SECRET_KEY", "")
 
 # Firebase Admin（服务账号 JSON 文件）
@@ -58,7 +60,7 @@ FIREBASE_CRED_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "service-accoun
 
 # Firestore Collections
 PAYOUTS_COLL_PATH = f"activities/{ACTIVITY_ID}/payouts"
-PARTICIPANTS_COLL_PATH = f"activities/{ACTIVITY_ID}/participants"
+PARTICIPANTS_COLL_PATH = f"activities/{ACTIVITY_ID}/participants"  # 预留：如需后端改写可复用
 
 # 批量/速率参数
 BATCH_LIMIT = int(os.getenv("PAYOUT_BATCH_LIMIT", "20"))
@@ -86,15 +88,23 @@ client = Client(RPC_ENDPOINT)
 def _load_keypair(secret: str) -> Keypair:
     if not secret:
         raise RuntimeError("SOLANA_TREASURY_SECRET_KEY not set")
-    # 尝试当作 JSON 数组
+    # 尝试当作 JSON 数组（Phantom 导出为 keypair 数组）
     try:
         arr = json.loads(secret)
         if isinstance(arr, list):
             return Keypair.from_secret_key(bytes(arr))
     except json.JSONDecodeError:
         pass
-    # 否则当作 Phantom Base58 私钥
-    return Keypair.from_base58_string(secret)
+    # 否则当作 Base58 私钥
+    try:
+        # 新版 solana-py 可能带有 from_base58_string
+        if hasattr(Keypair, "from_base58_string"):
+            return Keypair.from_base58_string(secret)
+    except Exception:
+        pass
+    # 手动 base58 解码
+    raw = base58.b58decode(secret)
+    return Keypair.from_secret_key(raw)
 
 treasury_kp = _load_keypair(TREASURY_SECRET)
 TREASURY_PUB = treasury_kp.public_key
@@ -170,7 +180,7 @@ def _ensure_ata(owner: PublicKey, mint: PublicKey, payer: Keypair) -> PublicKey:
     resp = client.get_account_info(ata)
     if resp.get("result", {}).get("value") is None:
         tx = Transaction()
-        # ✅ 修正参数顺序：payer.pubkey 作为费用支付者；owner 是目标账户的拥有者；第三参才是 mint
+        # ✅ 参数顺序：payer_pubkey（支付租金）、owner（目标账户拥有者）、mint
         tx.add(create_associated_token_account(payer.public_key, owner, mint))
         res = client.send_transaction(tx, payer, opts=TxOpts(skip_preflight=False))
         sig = res.get("result")
@@ -273,5 +283,4 @@ def run_batch():
 if __name__ == "__main__":
     # 在 Render 会注入 PORT 环境变量；本地可直接 python app.py 运行
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
-
 

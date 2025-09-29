@@ -8,7 +8,10 @@ firebase-admin==6.5.0
 # Solana Python SDK（包含 spl.token.* 子模块）
 solana==0.30.2
 
-# Render 上用 gunicorn 启动 Flask 应用
-gunicorn==21.2.0
+# Base58 兜底
+base58==2.1.1
 
+# 进程管理 / 启动器
+gunicorn==21.2.0
+uvicorn==0.30.6
 
