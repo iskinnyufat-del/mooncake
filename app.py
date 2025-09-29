@@ -1,6 +1,6 @@
 # app.py — Mooncake Payout Backend (Render-ready)
 # Flask + Firestore + Solana SPL 发放（安全：私钥仅从环境变量读取）
-# 你的前端 ACTIVITY_ID = "mid-autumn-2025"（已内置为默认值）
+# 前端 ACTIVITY_ID = "mid-autumn-2025"
 
 import os
 import json
@@ -36,7 +36,7 @@ load_dotenv()
 # Flask & CORS
 # -------------------------
 app = Flask(__name__)
-# 如果你要严格白名单，可把 origins 替换为 ["https://你的前端域名"]
+# 如需严格白名单，把 origins 改成 ["https://你的前端域名"]
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # -------------------------
@@ -165,12 +165,13 @@ def _mark_failed(item: PayoutItem, note: str):
     )
 
 def _ensure_ata(owner: PublicKey, mint: PublicKey, payer: Keypair) -> PublicKey:
+    """确保 owner 的 ATA 存在；若无则由 payer(=treasury) 代付租金创建。"""
     ata = get_associated_token_address(owner, mint)
     resp = client.get_account_info(ata)
     if resp.get("result", {}).get("value") is None:
         tx = Transaction()
-        # payer 既作 fee payer 也作 owner；为 owner=owner 创建 ATA，租金由 payer 支付
-        tx.add(create_associated_token_account(payer.public_key, payer.public_key, owner, mint))
+        # ✅ 修正参数顺序：payer.pubkey 作为费用支付者；owner 是目标账户的拥有者；第三参才是 mint
+        tx.add(create_associated_token_account(payer.public_key, owner, mint))
         res = client.send_transaction(tx, payer, opts=TxOpts(skip_preflight=False))
         sig = res.get("result")
         client.confirm_transaction(sig)
@@ -185,7 +186,7 @@ def _send_spl(to_addr: str, ui_amount: float) -> str:
     # 确保对方 ATA 存在
     dest_ata = _ensure_ata(dest_owner, mint_pk, treasury_kp)
 
-    # 金库源 ATA（若不存在，transfer_checked 会失败；建议上线前确保已创建并有余额）
+    # 金库源 ATA（建议上线前确认已存在并有余额）
     source_ata = get_associated_token_address(TREASURY_PUB, mint_pk)
 
     amount = _ui_to_base(ui_amount)
@@ -211,7 +212,7 @@ def _send_spl(to_addr: str, ui_amount: float) -> str:
 # Endpoints
 # -------------------------
 @app.get("/")
-def health():
+def root():
     # 提供给前端显示透明度（公钥/address），不会泄露私钥
     return jsonify({
         "ok": True,
@@ -220,6 +221,10 @@ def health():
         "mint": MINT_ADDRESS,
         "rpc": RPC_ENDPOINT,
     })
+
+@app.get("/health")
+def health():
+    return jsonify(status="ok")
 
 @app.post("/payout/enqueue")
 def enqueue():
@@ -266,5 +271,7 @@ def run_batch():
     return jsonify({"ok": True, "processed": len(items), "results": results})
 
 if __name__ == "__main__":
-    # 在 Render 会注入 PORT 环境变量
+    # 在 Render 会注入 PORT 环境变量；本地可直接 python app.py 运行
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
+
