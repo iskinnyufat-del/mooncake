@@ -16,19 +16,12 @@ from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# Solana client / tx
+# Solana (与 solana==0.25.0 搭配)
 from solana.rpc.api import Client
 from solana.rpc.types import TxOpts
 from solana.transaction import Transaction
-
-# --- 兼容导入：Keypair 保持用 solana.keypair；PublicKey 在 0.30+ moved to solders ---
-from solana.keypair import Keypair  # 仍然存在于 0.30.x
-try:
-    # solana < 0.30
-    from solana.publickey import PublicKey  # type: ignore
-except Exception:
-    # solana >= 0.30 使用 solders
-    from solders.pubkey import Pubkey as PublicKey  # type: ignore
+from solana.publickey import PublicKey
+from solana.keypair import Keypair
 
 # SPL Token helpers（随 solana 包提供，无需单独安装 spl-token CLI）
 from spl.token.instructions import (
@@ -93,11 +86,9 @@ db = firestore.client()
 client = Client(RPC_ENDPOINT)
 
 def _keypair_from_secret_bytes(secret_bytes: bytes) -> Keypair:
-    # 主要路径：solana.keypair.Keypair.from_secret_key
     try:
         return Keypair.from_secret_key(secret_bytes)
     except Exception as e:
-        # 极端兜底（通常不会走到）
         raise RuntimeError(f"Invalid secret key bytes: {e}")
 
 def _load_keypair(secret: str) -> Keypair:
@@ -291,6 +282,7 @@ def run_batch():
 if __name__ == "__main__":
     # 在 Render 会注入 PORT 环境变量；本地可直接 python app.py 运行
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
