@@ -1,0 +1,9 @@
+Flask==3.0.3
+flask-cors==4.0.1
+python-dotenv==1.0.1
+
+# Firebase Admin SDK
+firebase-admin==6.5.0
+
+# Solana Python SDK
+solana==0.30.2
