@@ -64,39 +64,15 @@ BATCH_LIMIT = int(os.getenv("PAYOUT_BATCH_LIMIT", "20"))
 SLEEP_BETWEEN_TX = float(os.getenv("PAYOUT_SLEEP", "0.5"))
 
 # -------------------------
-# Lottery Prize Table
+# Lottery Prize Table (Fixed, real logic only)
 # -------------------------
-LOTTERY_PROFILE = os.getenv("LOTTERY_PROFILE", "real").lower()
-PRIZE_TABLE_JSON = os.getenv("PRIZE_TABLE_JSON", "")
-
-def _get_prize_table() -> List[Dict[str, Any]]:
-    if PRIZE_TABLE_JSON:
-        try:
-            data = json.loads(PRIZE_TABLE_JSON)
-            if isinstance(data, list):
-                return data
-        except Exception:
-            pass
-
-    if LOTTERY_PROFILE == "fake":
-        return [
-            {"id":"mooncake","label":"Mooncake","type":"OFFCHAIN","weight":5},
-            {"id":"better-luck","label":"下次更好运","type":"NONE","weight":69},
-            {"id":"moon-10k","label":"10,000 $MOON","type":"SPL","amount":10000,"weight":20},
-            {"id":"moon-50k","label":"50,000 $MOON","type":"SPL","amount":50000,"weight":3},
-            {"id":"moon-100k","label":"100,000 $MOON","type":"SPL","amount":100000,"weight":2},
-            {"id":"random-big","label":"Random: 1 SOL / 1 BTC / 1 ETH（线下登记）","type":"OFFCHAIN","weight":1},
-        ]
-    else:
-        return [
-            {"id":"mooncake","label":"Mooncake","type":"OFFCHAIN","weight":5},
-            {"id":"better-luck","label":"下次更好运","type":"NONE","weight":70},
-            {"id":"moon-10k","label":"10,000 $MOON","type":"SPL","amount":10000,"weight":20},
-            {"id":"moon-50k","label":"50,000 $MOON","type":"SPL","amount":50000,"weight":3},
-            {"id":"moon-100k","label":"100,000 $MOON","type":"SPL","amount":100000,"weight":2},
-        ]
-
-PRIZE_TABLE: List[Dict[str, Any]] = _get_prize_table()
+PRIZE_TABLE: List[Dict[str, Any]] = [
+    {"id":"mooncake","label":"MOONcake","type":"OFFCHAIN","weight":5},
+    {"id":"better-luck","label":"Better luck next time","type":"NONE","weight":70},
+    {"id":"moon-10k","label":"10,000 $MOON","type":"SPL","amount":10000,"weight":20},
+    {"id":"moon-50k","label":"50,000 $MOON","type":"SPL","amount":50000,"weight":3},
+    {"id":"moon-100k","label":"100,000 $MOON","type":"SPL","amount":100000,"weight":2},
+]
 
 MAX_DRAWS_PER_WALLET = int(os.getenv("MAX_DRAWS_PER_WALLET", "0"))
 
@@ -276,7 +252,7 @@ def root():
         "treasury": str(TREASURY_PUB),
         "mint": MINT_ADDRESS,
         "rpc": RPC_ENDPOINT,
-        "profile": LOTTERY_PROFILE,
+        "profile": "real",  # always real
     })
 
 @app.get("/health")
@@ -290,7 +266,7 @@ def get_config():
         "mint": MINT_ADDRESS,
         "mintDecimals": MINT_DECIMALS,
         "maxDrawsPerWallet": MAX_DRAWS_PER_WALLET,
-        "profile": LOTTERY_PROFILE,
+        "profile": "real",
         "prizes": PRIZE_TABLE,
     }
     try:
@@ -330,7 +306,7 @@ def draw_once():
         "type": prize.get("type"),
         "amount": float(prize.get("amount", 0)) if prize.get("type") == "SPL" else None,
         "clientSeed": client_seed or None,
-        "profile": LOTTERY_PROFILE,
+        "profile": "real",
         "timestamp": firestore.SERVER_TIMESTAMP,
     }
 
@@ -404,6 +380,7 @@ def run_batch():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
