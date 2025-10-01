@@ -4,27 +4,24 @@ services:
     env: python
     region: singapore
     plan: free
-    buildCommand: >
-      pip install --upgrade pip &&
-      pip install -r requirements.txt &&
-      python -c "import solana; print('solana OK', solana.__version__)"
-    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT -w 1 --timeout 180
-    healthCheckPath: /health
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "gunicorn app:app --bind 0.0.0.0:$PORT -w 2 --timeout 180 --preload"
+    healthCheckPath: "/health"
     envVars:
       - key: PYTHON_VERSION
-        value: 3.11.9
+        value: 3.11.9          # 🔒 固定到 3.11，避开 3.13 引发的 solders/typing_extensions 问题
       - key: ADMIN_TOKEN
-        sync: false
+        sync: false            # 在控制台填写
       - key: ACTIVITY_ID
         value: mid-autumn-2025
       - key: SOLANA_RPC
         value: https://api.mainnet-beta.solana.com
       - key: SPL_MINT
-        sync: false
+        sync: false            # 在控制台填写
       - key: SPL_DECIMALS
         value: "6"
       - key: SOLANA_TREASURY_SECRET_KEY
-        sync: false
+        sync: false            # 在控制台填写（JSON数组 或 base58）
       - key: GOOGLE_APPLICATION_CREDENTIALS
         value: /etc/secrets/service-account.json
       - key: CORS_ORIGINS
@@ -33,6 +30,11 @@ services:
         value: "20"
       - key: PAYOUT_SLEEP
         value: "0.5"
+    secretFiles:
+      - name: service-account.json
+        path: /etc/secrets/service-account.json   # 🔒 与上面的 GAC 路径一致
+        sync: false
+
 
 
 
