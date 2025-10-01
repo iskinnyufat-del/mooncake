@@ -1,4 +1,4 @@
-# app.py — Mooncake Lottery + Payout Backend (Docker/Render-ready, solders-based)
+# app.py — Mooncake Lottery + Payout Backend (legacy-solana API, no solders)
 
 import os
 import json
@@ -16,21 +16,18 @@ from dotenv import load_dotenv
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# ---- Solana RPC (仍用 solana-py 的 Client/Transaction) ----
+# Solana (legacy-style API from solana==0.25.x)
 from solana.rpc.api import Client
 from solana.rpc.types import TxOpts
 from solana.transaction import Transaction
+from solana.publickey import PublicKey
+from solana.keypair import Keypair
 
-# ---- 关键改动：使用 solders 的密钥与公钥类型 ----
-from solders.pubkey import Pubkey
-from solders.keypair import Keypair
-
-# ---- SPL Token helpers（仍用 spl 包）----
+# SPL Token helpers
 from spl.token.instructions import (
     get_associated_token_address,
     create_associated_token_account,
     transfer_checked,
-    TransferCheckedParams,
 )
 from spl.token.constants import TOKEN_PROGRAM_ID
 
@@ -56,7 +53,7 @@ MINT_DECIMALS = int(os.getenv("SPL_DECIMALS", "6"))
 
 TREASURY_SECRET = os.getenv("SOLANA_TREASURY_SECRET_KEY", "")
 
-FIREBASE_CRED_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "service-account.json")
+FIREBASE_CRED_PATH = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "/etc/secrets/service-account.json")
 
 BASE_ACTIVITY_PATH = f"activities/{ACTIVITY_ID}"
 PAYOUTS_COLL_PATH = f"{BASE_ACTIVITY_PATH}/payouts"
@@ -80,18 +77,27 @@ PRIZE_TABLE: List[Dict[str, Any]] = [
 ]
 
 # -------------------------
-# Bootstrap Firestore
+# Bootstrap Firestore (fail-safe)
 # -------------------------
-if not firebase_admin._apps:
-    if not os.path.exists(FIREBASE_CRED_PATH):
-        raise RuntimeError(
-            "Missing Firebase service-account.json. "
-            "Upload it as a Secret File on Render and set GOOGLE_APPLICATION_CREDENTIALS to that path."
-        )
-    cred = credentials.Certificate(FIREBASE_CRED_PATH)
-    firebase_admin.initialize_app(cred)
+def _init_firestore_or_log():
+    try:
+        if not os.path.exists(FIREBASE_CRED_PATH):
+            raise FileNotFoundError(f"GAC not found at {FIREBASE_CRED_PATH}")
+        with open(FIREBASE_CRED_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        cred = credentials.Certificate(data)
+        firebase_admin.initialize_app(cred)
+        return firestore.client()
+    except Exception as e:
+        app.logger.error(f"[FIREBASE] credentials load failed: {e}")
+        return None
 
-db = firestore.client()
+db = _init_firestore_or_log()
+
+def _require_db():
+    if db is None:
+        return jsonify({"ok": False, "error": "firestore_not_ready", "hint": "Check service-account.json"}), 503
+    return None
 
 # -------------------------
 # Bootstrap Solana client & treasury
@@ -99,13 +105,13 @@ db = firestore.client()
 client = Client(RPC_ENDPOINT)
 
 def _keypair_from_secret_bytes(secret_bytes: bytes) -> Keypair:
-    # solders Keypair 从 64-byte secret 生成
-    return Keypair.from_bytes(secret_bytes)
+    # Keypair.from_secret_key expects 64-byte secret (ed25519 private key + public key)
+    return Keypair.from_secret_key(secret_bytes)
 
 def _load_keypair(secret: str) -> Keypair:
     if not secret:
         raise RuntimeError("SOLANA_TREASURY_SECRET_KEY not set")
-    # Phantom 导出的 JSON 数组
+    # JSON 数组（Phantom 导出）
     try:
         arr = json.loads(secret)
         if isinstance(arr, list):
@@ -122,7 +128,7 @@ def _load_keypair(secret: str) -> Keypair:
     return _keypair_from_secret_bytes(raw)
 
 treasury_kp = _load_keypair(TREASURY_SECRET)
-TREASURY_PUB: Pubkey = treasury_kp.pubkey()
+TREASURY_PUB: PublicKey = treasury_kp.public_key
 
 # -------------------------
 # Dataclass
@@ -147,6 +153,9 @@ def _ui_to_base(amount_ui: float) -> int:
     return int(round(amount_ui * (10 ** MINT_DECIMALS)))
 
 def _fetch_pending(limit: int) -> List[PayoutItem]:
+    err = _require_db()
+    if err:  # 503
+        raise RuntimeError("firestore_not_ready")
     qs = (
         db.collection(PAYOUTS_COLL_PATH)
         .where("status", "==", "pending")
@@ -170,54 +179,55 @@ def _fetch_pending(limit: int) -> List[PayoutItem]:
     return out
 
 def _mark_paid(item: PayoutItem, sig: str):
+    if db is None: return
     db.document(f"{PAYOUTS_COLL_PATH}/{item.id}").set(
         {"status": "paid", "tx": sig, "paidAt": firestore.SERVER_TIMESTAMP}, merge=True
     )
 
 def _mark_failed(item: PayoutItem, note: str):
+    if db is None: return
     db.document(f"{PAYOUTS_COLL_PATH}/{item.id}").set(
         {"status": "failed", "note": note, "updatedAt": firestore.SERVER_TIMESTAMP},
         merge=True,
     )
 
-def _ensure_ata(owner: Pubkey, mint: Pubkey, payer: Keypair) -> Pubkey:
+def _ensure_ata(owner: PublicKey, mint: PublicKey, payer: Keypair) -> PublicKey:
     ata = get_associated_token_address(owner, mint)
     resp = client.get_account_info(ata)
     if resp.get("result", {}).get("value") is None:
         tx = Transaction()
-        tx.add(create_associated_token_account(payer.pubkey(), owner, mint))
+        tx.add(create_associated_token_account(payer.public_key, owner, mint))
         res = client.send_transaction(tx, payer, opts=TxOpts(skip_preflight=False))
         sig = res.get("result")
-        client.confirm_transaction(sig, commitment="confirmed")
+        client.confirm_transaction(sig)
     return ata
 
 def _send_spl(to_addr: str, ui_amount: float) -> str:
     if not MINT_ADDRESS:
         raise RuntimeError("SPL_MINT not set.")
-    mint_pk = Pubkey.from_string(MINT_ADDRESS)
-    dest_owner = Pubkey.from_string(to_addr)
+    mint_pk = PublicKey(MINT_ADDRESS)
+    dest_owner = PublicKey(to_addr)
     dest_ata = _ensure_ata(dest_owner, mint_pk, treasury_kp)
     source_ata = get_associated_token_address(TREASURY_PUB, mint_pk)
     amount = _ui_to_base(ui_amount)
 
     tx = Transaction()
+    # legacy API: transfer_checked 参数是位置参数
     tx.add(
         transfer_checked(
-            TransferCheckedParams(
-                program_id=TOKEN_PROGRAM_ID,
-                source=source_ata,
-                mint=mint_pk,
-                dest=dest_ata,
-                owner=TREASURY_PUB,
-                amount=amount,
-                decimals=MINT_DECIMALS,
-                signers=None,  # 多签可传额外 signer pubkey 列表
-            )
+            source=source_ata,
+            mint=mint_pk,
+            dest=dest_ata,
+            owner=TREASURY_PUB,
+            amount=amount,
+            decimals=MINT_DECIMALS,
+            program_id=TOKEN_PROGRAM_ID,
+            signers=None,
         )
     )
     res = client.send_transaction(tx, treasury_kp, opts=TxOpts(skip_preflight=False))
     sig = res.get("result")
-    client.confirm_transaction(sig, commitment="confirmed")
+    client.confirm_transaction(sig)
     return sig
 
 def _weighted_choice(items: List[Dict[str, Any]], rnd: random.Random) -> Dict[str, Any]:
@@ -233,16 +243,20 @@ def _weighted_choice(items: List[Dict[str, Any]], rnd: random.Random) -> Dict[st
 
 def _safe_pubkey_str(s: str) -> Optional[str]:
     try:
-        _ = Pubkey.from_string(s)
+        _ = PublicKey(s)
         return s
     except Exception:
         return None
 
 def _count_wallet_draws(wallet: str) -> int:
+    err = _require_db()
+    if err: return 0
     qs = db.collection(DRAWS_COLL_PATH).where("wallet", "==", wallet).stream()
     return sum(1 for _ in qs)
 
 def _enqueue_payout(address: str, amount: float, note: Optional[str]):
+    err = _require_db()
+    if err: raise RuntimeError("firestore_not_ready")
     doc_ref = db.collection(PAYOUTS_COLL_PATH).document()
     doc_ref.set(
         {
@@ -283,12 +297,13 @@ def get_config():
         "profile": "real",
         "prizes": PRIZE_TABLE,
     }
-    try:
-        db.document(CONFIG_DOC_PATH).set(
-            {**cfg, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True
-        )
-    except Exception as e:
-        app.logger.warning(f"[CONFIG] Firestore snapshot failed: {e}")
+    if db is not None:
+        try:
+            db.document(CONFIG_DOC_PATH).set(
+                {**cfg, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True
+            )
+        except Exception as e:
+            app.logger.warning(f"[CONFIG] Firestore snapshot failed: {e}")
     return jsonify({"ok": True, "config": cfg})
 
 @app.post("/draw")
@@ -321,7 +336,7 @@ def draw_once():
         "amount": float(prize.get("amount", 0)) if prize.get("type") == "SPL" else None,
         "clientSeed": client_seed or None,
         "profile": "real",
-        "timestamp": firestore.SERVER_TIMESTAMP,
+        "timestamp": firestore.SERVER_TIMESTAMP if db is not None else None,
     }
 
     payout_id = None
@@ -329,6 +344,9 @@ def draw_once():
         if not MINT_ADDRESS:
             draw_doc["payoutEnqueued"] = False
             draw_doc["payoutError"] = "SPL_MINT not set"
+        elif db is None:
+            draw_doc["payoutEnqueued"] = False
+            draw_doc["payoutError"] = "firestore_not_ready"
         else:
             try:
                 payout_id = _enqueue_payout(wallet, float(prize["amount"]), f"draw:{prize['id']}")
@@ -338,9 +356,16 @@ def draw_once():
                 draw_doc["payoutEnqueued"] = False
                 draw_doc["payoutError"] = str(e)
 
-    doc_ref = db.collection(DRAWS_COLL_PATH).document()
-    doc_ref.set(draw_doc)
-    draw_id = doc_ref.id
+    if db is not None:
+        try:
+            doc_ref = db.collection(DRAWS_COLL_PATH).document()
+            doc_ref.set(draw_doc)
+            draw_id = doc_ref.id
+        except Exception as e:
+            app.logger.warning(f"[DRAW] write failed: {e}")
+            draw_id = None
+    else:
+        draw_id = None
 
     return jsonify({
         "ok": True,
@@ -359,6 +384,8 @@ def draw_once():
 def enqueue():
     if not _require_admin(request):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
+    if db is None:
+        return jsonify({"ok": False, "error": "firestore_not_ready"}), 503
     body = request.get_json(force=True)
     address = (body.get("address") or "").strip()
     amount = float(body.get("amount") or 0)
@@ -379,6 +406,8 @@ def enqueue():
 def run_batch():
     if not _require_admin(request):
         return jsonify({"ok": False, "error": "unauthorized"}), 401
+    if db is None:
+        return jsonify({"ok": False, "error": "firestore_not_ready"}), 503
     items = _fetch_pending(BATCH_LIMIT)
     results = []
     for it in items:
@@ -393,15 +422,14 @@ def run_batch():
     return jsonify({"ok": True, "processed": len(items), "results": results})
 
 # -------------------------
-# Diagnostics (keep them)
+# Diagnostics
 # -------------------------
 @app.get("/versions")
 def versions():
-    import sys, platform, pkgutil, importlib
+    import sys, platform, pkgutil
     info = {
         "python": sys.version,
         "platform": platform.platform(),
-        "runtime_note": "Docker uses Python 3.11",
         "env": {
             "SOLANA_RPC": os.getenv("SOLANA_RPC"),
             "GOOGLE_APPLICATION_CREDENTIALS": os.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
@@ -409,11 +437,10 @@ def versions():
         "checks": {},
     }
     for mod in [
-        "solana",
+        "solana.publickey",
+        "solana.keypair",
         "solana.transaction",
         "spl.token.instructions",
-        "solders.pubkey",
-        "solders.keypair",
     ]:
         info["checks"][mod] = bool(pkgutil.find_loader(mod))
     try:
@@ -422,19 +449,18 @@ def versions():
     except Exception as e:
         info["solana_version_error"] = str(e)
     try:
-        import solders
-        info["solders_version"] = getattr(solders, "__version__", "unknown")
-    except Exception as e:
-        info["solders_version_error"] = str(e)
-    gac = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or ""
-    info["gac_exists"] = os.path.exists(gac) if gac else False
+        import solders  # 允许不存在
+        info["solders_version"] = getattr(solders, "__version__", "not_installed")
+    except Exception:
+        info["solders_version"] = "not_installed"
+    info["gac_exists"] = os.path.exists(FIREBASE_CRED_PATH)
     return jsonify(info)
 
 @app.get("/import-debug")
 def import_debug():
     import importlib, inspect, sys
     data = {"paths": sys.path[:15], "modules": {}}
-    for mod in ["solana", "spl", "base58", "solders", "solders.pubkey", "solders.keypair"]:
+    for mod in ["solana", "solana.publickey", "spl", "spl.token.instructions"]:
         try:
             m = importlib.import_module(mod)
             data["modules"][mod] = {"file": inspect.getfile(m)}
@@ -444,6 +470,7 @@ def import_debug():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
