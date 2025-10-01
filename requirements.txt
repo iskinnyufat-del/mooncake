@@ -1,18 +1,10 @@
 Flask==3.0.3
 flask-cors==4.0.1
 python-dotenv==1.0.1
-
-# Firebase Admin SDK（自带 google-cloud-firestore 依赖）
 firebase-admin==6.5.0
-
-# Solana Python SDK（老版本，含 solana.publickey / solana.keypair）
-solana==0.25.0
-
-# Base58 兜底
+solana==0.30.2
+spl-token==0.1.0
 base58==2.1.1
-
-# 进程管理 / 启动器
 gunicorn==21.2.0
-uvicorn==0.30.6
 
 
