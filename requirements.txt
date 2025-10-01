@@ -9,11 +9,9 @@ google-auth==2.34.0
 # solana 生态（和 Python 3.11 兼容；避免 3.13）
 solana==0.30.2
 solders==0.18.1
-spl-token
 base58==2.1.1
 
 typing_extensions==4.12.2
-
 
 
 
