@@ -45,102 +45,6 @@ CORS(app, resources={r"/*": {"origins": os.getenv("CORS_ORIGINS", "*").split(","
 # -------------------------
 # Required Config
 # -------------------------
-@app.get("/versions")
-def versions():
-    import sys, platform, pkgutil, importlib
-    result = {
-        "ok": True,
-        "python": sys.version,
-        "platform": platform.platform(),
-        "rpc": RPC_ENDPOINT,
-        "gac_path": FIREBASE_CRED_PATH,
-        "gac_exists": os.path.exists(FIREBASE_CRED_PATH),
-        "checks": {},
-    }
-
-    # ---- solana ----
-    try:
-        import solana
-        result["solana_version"] = getattr(solana, "__version__", "unknown")
-        result["checks"]["solana.publickey"] = bool(pkgutil.find_loader("solana.publickey"))
-        result["checks"]["solana.keypair"] = bool(pkgutil.find_loader("solana.keypair"))
-        result["checks"]["solana.transaction"] = bool(pkgutil.find_loader("solana.transaction"))
-    except Exception as e:
-        result["solana_error"] = str(e)
-
-    # ---- solders ----
-    try:
-        import solders
-        result["solders_version"] = getattr(solders, "__version__", "unknown")
-    except Exception as e:
-        result["solders_error"] = str(e)
-
-    # ---- spl token helpers (from solana package) ----
-    result["checks"]["spl.token.instructions"] = bool(pkgutil.find_loader("spl.token.instructions"))
-
-    # 可选：尝试真实 import 验证（会更严格）
-    strict_errors = {}
-    for mod in ["solana.publickey", "solana.keypair", "spl.token.instructions"]:
-        try:
-            importlib.import_module(mod)
-        except Exception as e:
-            strict_errors[mod] = str(e)
-    if strict_errors:
-        result["strict_import_errors"] = strict_errors
-
-    return jsonify(result)
-    @app.get("/versions")
-def versions():
-    import sys, platform, pkgutil, importlib, os
-    info = {
-        "python": sys.version,
-        "platform": platform.platform(),
-        "runtime_note": "Expect python-3.11.9 via runtime.txt",
-        "env": {
-            "SOLANA_RPC": os.getenv("SOLANA_RPC"),
-            "GOOGLE_APPLICATION_CREDENTIALS": os.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
-        },
-        "checks": {},
-    }
-    # 检查几个关键模块是否能找到
-    for mod in [
-        "solana",
-        "solana.publickey",
-        "solana.keypair",
-        "solana.transaction",
-        "spl.token.instructions",
-    ]:
-        info["checks"][mod] = bool(pkgutil.find_loader(mod))
-    try:
-        import solana
-        info["solana_version"] = getattr(solana, "__version__", "unknown")
-    except Exception as e:
-        info["solana_version_error"] = str(e)
-    try:
-        import solders
-        info["solders_version"] = getattr(solders, "__version__", "unknown")
-    except Exception as e:
-        info["solders_version_error"] = str(e)
-    # 检查 Firebase 文件存在性
-    gac = os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or ""
-    info["gac_exists"] = os.path.exists(gac) if gac else False
-    return jsonify(info)
-
-
-@app.get("/import-debug")
-def import_debug():
-    import importlib, inspect, sys
-    data = {"paths": sys.path[:10], "modules": {}}
-    for mod in ["solana", "spl", "base58"]:
-        try:
-            m = importlib.import_module(mod)
-            data["modules"][mod] = {"file": inspect.getfile(m)}
-        except Exception as e:
-            data["modules"][mod] = {"error": str(e)}
-    return jsonify(data)
-
-
-
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "dev-admin-token")
 ACTIVITY_ID = os.getenv("ACTIVITY_ID", "mid-autumn-2025")
 RPC_ENDPOINT = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
@@ -483,6 +387,7 @@ def run_batch():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
