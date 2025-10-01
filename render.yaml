@@ -1,17 +1,10 @@
 services:
   - type: web
     name: mooncake-backend
-    env: python
+    env: docker
     region: singapore
     plan: free
-    buildCommand: |
-      python -m pip install --upgrade pip
-      # 强制重装 solana 生态依赖，避免旧版
-      pip install --no-cache-dir --force-reinstall \
-        solana==0.30.2 solders==0.18.1 base58==2.1.1
-      # 安装其他依赖
-      pip install --no-cache-dir -r requirements.txt
-    startCommand: "gunicorn app:app --bind 0.0.0.0:$PORT -w 2 --timeout 180"
+    dockerfilePath: ./Dockerfile
     healthCheckPath: "/health"
 
     envVars:
@@ -42,7 +35,6 @@ services:
       - name: service-account.json
         path: /etc/secrets/service-account.json
         sync: false
-
 
 
 
