@@ -1,15 +1,17 @@
-flask==3.0.3
-flask-cors==4.0.0
-python-dotenv==1.0.1
-firebase-admin==6.5.0
-
-solana==0.25.0
-construct==2.10.68
-base58==2.1.1
-pynacl==1.5.0
-typing_extensions==4.5.0
-
+Flask==3.0.3
 gunicorn==21.2.0
+flask-cors==4.0.1
+python-dotenv==1.0.1
+
+firebase-admin==6.5.0
+google-cloud-firestore==2.16.0
+
+solana==0.30.2
+solders==0.20.0
+typing_extensions==4.12.2
+base58==2.1.1
+
+
 
 
 
