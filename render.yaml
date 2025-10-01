@@ -1,3 +1,7 @@
+buildCommand: |
+  python -m pip install --upgrade pip
+  pip install --no-cache-dir -r requirements.txt
+
 services:
   - type: web
     name: mooncake-backend
@@ -34,6 +38,7 @@ services:
       - name: service-account.json
         path: /etc/secrets/service-account.json  # 与 GAC 路径一致
         sync: false
+
 
 
 
