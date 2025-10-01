@@ -3,8 +3,12 @@ services:
     name: mooncake
     env: python
     plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app -k gthread -w 2 -b 0.0.0.0:$PORT --timeout 180 --preload
+    buildCommand: >
+      pip install --upgrade pip &&
+      pip install -r requirements.txt &&
+      python -c "import sys; print('PY', sys.version); import solana; print('solana OK', solana.__version__)"
+    startCommand: >
+      gunicorn app:app -k gthread -w 2 -b 0.0.0.0:$PORT --timeout 180 --preload
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
