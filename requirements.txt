@@ -1,13 +1,16 @@
-Flask==2.3.3
-flask-cors==4.0.0
+Flask==3.0.3
 gunicorn==21.2.0
-python-dotenv==1.0.0
-firebase-admin==6.2.0
+flask-cors==4.0.0
+python-dotenv==1.0.1
 
+firebase-admin==6.5.0
+
+# 与app.py 完全匹配的一组 Solana 依赖（这组在 Python 3.11 下稳定）
 solana==0.30.2
 solders==0.18.1
-httpx==0.23.3
-base58==2.1.1
+typing_extensions==4.8.0
+
+
 
 
 
