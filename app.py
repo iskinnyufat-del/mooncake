@@ -467,9 +467,54 @@ def import_debug():
         except Exception as e:
             data["modules"][mod] = {"error": str(e)}
     return jsonify(data)
+# 最近中奖名单：服务端读取 Firestore 并做轻筛选/脱敏
+@app.get("/draws/latest")
+def draws_latest():
+    if db is None:
+        return jsonify({"ok": False, "error": "firestore_not_ready"}), 503
+    try:
+        # limit 参数：默认 5，1~50 之间
+        try:
+            lim = int(request.args.get("limit", "5"))
+        except Exception:
+            lim = 5
+        lim = max(1, min(lim, 50))
+
+        # 过取一些（*3），过滤掉未中奖，再截到 limit
+        qs = (
+            db.collection(DRAWS_COLL_PATH)
+              .order_by("timestamp", direction=firestore.Query.DESCENDING)
+              .limit(lim * 3)
+              .stream()
+        )
+
+        out = []
+        for doc in qs:
+            d = doc.to_dict() or {}
+            typ = str(d.get("type") or "").upper()
+            if typ == "NONE":
+                continue  # 跳过未中奖
+            wallet = d.get("wallet") or d.get("address")
+            prize_label = d.get("prizeLabel") or (d.get("prize") or {}).get("label")
+            ts = d.get("timestamp")
+            out.append({
+                "wallet": wallet,
+                "prizeLabel": prize_label,
+                "type": typ,
+                "timestamp": ts.isoformat() if ts else None,
+            })
+            if len(out) >= lim:
+                break
+
+        return jsonify({"ok": True, "draws": out})
+    except Exception as e:
+        app.logger.error(f"/draws/latest error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
