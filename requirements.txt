@@ -3,14 +3,14 @@ flask-cors==4.0.0
 python-dotenv==1.0.1
 firebase-admin==6.5.0
 
-# 兼容 from solana.publickey import PublicKey 的老版
 solana==0.25.0
+construct==2.10.68
 base58==2.1.1
 pynacl==1.5.0
-construct==2.10.68
-typing_extensions<4.6
+typing_extensions==4.5.0
 
 gunicorn==21.2.0
+
 
 
 
