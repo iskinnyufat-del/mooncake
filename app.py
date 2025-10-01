@@ -23,12 +23,14 @@ from solana.transaction import Transaction
 from solana.publickey import PublicKey
 from solana.keypair import Keypair
 
-# SPL Token helpers
+# SPL Token helpers (solana==0.30.x)
 from spl.token.instructions import (
     get_associated_token_address,
     create_associated_token_account,
     transfer_checked,
+    TransferCheckedParams,
 )
+from spl.token.constants import TOKEN_PROGRAM_ID
 
 import base58
 
@@ -62,19 +64,18 @@ CONFIG_DOC_PATH = f"{BASE_ACTIVITY_PATH}/config"
 
 BATCH_LIMIT = int(os.getenv("PAYOUT_BATCH_LIMIT", "20"))
 SLEEP_BETWEEN_TX = float(os.getenv("PAYOUT_SLEEP", "0.5"))
+MAX_DRAWS_PER_WALLET = int(os.getenv("MAX_DRAWS_PER_WALLET", "0"))
 
 # -------------------------
 # Lottery Prize Table (Fixed, real logic only)
 # -------------------------
 PRIZE_TABLE: List[Dict[str, Any]] = [
-    {"id":"mooncake","label":"MOONcake","type":"OFFCHAIN","weight":5},
-    {"id":"better-luck","label":"Better luck next time","type":"NONE","weight":70},
-    {"id":"moon-10k","label":"10,000 $MOON","type":"SPL","amount":10000,"weight":20},
-    {"id":"moon-50k","label":"50,000 $MOON","type":"SPL","amount":50000,"weight":3},
-    {"id":"moon-100k","label":"100,000 $MOON","type":"SPL","amount":100000,"weight":2},
+    {"id": "mooncake", "label": "MOONcake", "type": "OFFCHAIN", "weight": 5},
+    {"id": "better-luck", "label": "Better luck next time", "type": "NONE", "weight": 70},
+    {"id": "moon-10k", "label": "10,000 $MOON", "type": "SPL", "amount": 10000, "weight": 20},
+    {"id": "moon-50k", "label": "50,000 $MOON", "type": "SPL", "amount": 50000, "weight": 3},
+    {"id": "moon-100k", "label": "100,000 $MOON", "type": "SPL", "amount": 100000, "weight": 2},
 ]
-
-MAX_DRAWS_PER_WALLET = int(os.getenv("MAX_DRAWS_PER_WALLET", "0"))
 
 # -------------------------
 # Bootstrap Firestore
@@ -101,12 +102,14 @@ def _keypair_from_secret_bytes(secret_bytes: bytes) -> Keypair:
 def _load_keypair(secret: str) -> Keypair:
     if not secret:
         raise RuntimeError("SOLANA_TREASURY_SECRET_KEY not set")
+    # JSON 数组（Phantom 导出）
     try:
         arr = json.loads(secret)
         if isinstance(arr, list):
             return _keypair_from_secret_bytes(bytes(arr))
     except json.JSONDecodeError:
         pass
+    # base58 字符串
     raw = base58.b58decode(secret)
     return _keypair_from_secret_bytes(raw)
 
@@ -177,7 +180,8 @@ def _ensure_ata(owner: PublicKey, mint: PublicKey, payer: Keypair) -> PublicKey:
         tx.add(create_associated_token_account(payer.public_key, owner, mint))
         res = client.send_transaction(tx, payer, opts=TxOpts(skip_preflight=False))
         sig = res.get("result")
-        client.confirm_transaction(sig)
+        # 显式确认级别
+        client.confirm_transaction(sig, commitment="confirmed")
     return ata
 
 def _send_spl(to_addr: str, ui_amount: float) -> str:
@@ -192,18 +196,21 @@ def _send_spl(to_addr: str, ui_amount: float) -> str:
     tx = Transaction()
     tx.add(
         transfer_checked(
-            source=source_ata,
-            mint=mint_pk,
-            dest=dest_ata,
-            owner=TREASURY_PUB,
-            amount=amount,
-            decimals=MINT_DECIMALS,
-            signers=[treasury_kp],
+            TransferCheckedParams(
+                program_id=TOKEN_PROGRAM_ID,
+                source=source_ata,
+                mint=mint_pk,
+                dest=dest_ata,
+                owner=TREASURY_PUB,
+                amount=amount,
+                decimals=MINT_DECIMALS,
+                signers=None,  # 若使用多签，这里传 [<owner-pubkey-2>, ...]
+            )
         )
     )
     res = client.send_transaction(tx, treasury_kp, opts=TxOpts(skip_preflight=False))
     sig = res.get("result")
-    client.confirm_transaction(sig)
+    client.confirm_transaction(sig, commitment="confirmed")
     return sig
 
 def _weighted_choice(items: List[Dict[str, Any]], rnd: random.Random) -> Dict[str, Any]:
@@ -380,6 +387,7 @@ def run_batch():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
