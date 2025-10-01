@@ -1,16 +1,38 @@
 services:
   - type: web
-    name: mooncake
+    name: mooncake-backend
     env: python
+    region: singapore
     plan: free
     buildCommand: >
       pip install --upgrade pip &&
       pip install -r requirements.txt &&
-      python -c "import sys; print('PY', sys.version); import solana; print('solana OK', solana.__version__)"
-    startCommand: >
-      gunicorn app:app -k gthread -w 2 -b 0.0.0.0:$PORT --timeout 180 --preload
+      python -c "import solana; print('solana OK', solana.__version__)"
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT -w 1 --timeout 180
+    healthCheckPath: /health
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
+      - key: ADMIN_TOKEN
+        sync: false
+      - key: ACTIVITY_ID
+        value: mid-autumn-2025
+      - key: SOLANA_RPC
+        value: https://api.mainnet-beta.solana.com
+      - key: SPL_MINT
+        sync: false
+      - key: SPL_DECIMALS
+        value: "6"
+      - key: SOLANA_TREASURY_SECRET_KEY
+        sync: false
+      - key: GOOGLE_APPLICATION_CREDENTIALS
+        value: /etc/secrets/service-account.json
+      - key: CORS_ORIGINS
+        value: "*"
+      - key: PAYOUT_BATCH_LIMIT
+        value: "20"
+      - key: PAYOUT_SLEEP
+        value: "0.5"
+
 
 
