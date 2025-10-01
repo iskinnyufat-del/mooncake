@@ -45,6 +45,52 @@ CORS(app, resources={r"/*": {"origins": os.getenv("CORS_ORIGINS", "*").split(","
 # -------------------------
 # Required Config
 # -------------------------
+@app.get("/versions")
+def versions():
+    import sys, platform, pkgutil, importlib
+    result = {
+        "ok": True,
+        "python": sys.version,
+        "platform": platform.platform(),
+        "rpc": RPC_ENDPOINT,
+        "gac_path": FIREBASE_CRED_PATH,
+        "gac_exists": os.path.exists(FIREBASE_CRED_PATH),
+        "checks": {},
+    }
+
+    # ---- solana ----
+    try:
+        import solana
+        result["solana_version"] = getattr(solana, "__version__", "unknown")
+        result["checks"]["solana.publickey"] = bool(pkgutil.find_loader("solana.publickey"))
+        result["checks"]["solana.keypair"] = bool(pkgutil.find_loader("solana.keypair"))
+        result["checks"]["solana.transaction"] = bool(pkgutil.find_loader("solana.transaction"))
+    except Exception as e:
+        result["solana_error"] = str(e)
+
+    # ---- solders ----
+    try:
+        import solders
+        result["solders_version"] = getattr(solders, "__version__", "unknown")
+    except Exception as e:
+        result["solders_error"] = str(e)
+
+    # ---- spl token helpers (from solana package) ----
+    result["checks"]["spl.token.instructions"] = bool(pkgutil.find_loader("spl.token.instructions"))
+
+    # 可选：尝试真实 import 验证（会更严格）
+    strict_errors = {}
+    for mod in ["solana.publickey", "solana.keypair", "spl.token.instructions"]:
+        try:
+            importlib.import_module(mod)
+        except Exception as e:
+            strict_errors[mod] = str(e)
+    if strict_errors:
+        result["strict_import_errors"] = strict_errors
+
+    return jsonify(result)
+
+
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "dev-admin-token")
 ACTIVITY_ID = os.getenv("ACTIVITY_ID", "mid-autumn-2025")
 RPC_ENDPOINT = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
@@ -387,6 +433,7 @@ def run_batch():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
