@@ -1,14 +1,18 @@
 Flask==3.0.3
+Flask-Cors==4.0.0
 gunicorn==21.2.0
-flask-cors==4.0.0
 python-dotenv==1.0.1
 
 firebase-admin==6.5.0
+google-auth==2.34.0
 
+# solana 生态（和 Python 3.11 兼容；避免 3.13）
 solana==0.30.2
 solders==0.18.1
-typing_extensions==4.8.0
+spl-token
 base58==2.1.1
+
+typing_extensions==4.12.2
 
 
 
