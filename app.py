@@ -46,7 +46,36 @@ CORS(app, resources={r"/*": {"origins": os.getenv("CORS_ORIGINS", "*").split(","
 # -------------------------
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "dev-admin-token")
 ACTIVITY_ID = os.getenv("ACTIVITY_ID", "mid-autumn-2025")
-RPC_ENDPOINT = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
+
+# RPC 主节点 + 回退（逗号分隔），服务器侧不受浏览器 CORS 限制，但仍可能超时/限流，这里做多节点兜底
+RPC_PRIMARY = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com").strip()
+RPC_FALLBACKS_ENV = [u.strip() for u in os.getenv("SOLANA_RPC_FALLBACKS", "").split(",") if u.strip()]
+RPC_TIMEOUT_SEC = float(os.getenv("SOLANA_RPC_TIMEOUT_MS", "2500")) / 1000.0  # client超时
+
+# 可选公共兜底（按可靠性排序）
+PUBLIC_FALLBACKS = [
+    "https://solana.publicnode.com",
+    "https://rpc.ankr.com/solana",
+    "https://solana-rpc.publicnode.com",
+    "https://api.mainnet-beta.solana.com",  # 最后尝试官方
+]
+
+def _dedupe(seq: List[str]) -> List[str]:
+    seen = set()
+    out = []
+    for x in seq:
+        k = (x or "").strip()
+        if not k:
+            continue
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+RPC_LIST: List[str] = _dedupe([RPC_PRIMARY] + RPC_FALLBACKS_ENV + PUBLIC_FALLBACKS)
+
+# 服务器的伪随机盐（可选）
+SERVER_SALT = os.getenv("SERVER_SALT", "")
 
 MINT_ADDRESS = os.getenv("SPL_MINT", "")
 MINT_DECIMALS = int(os.getenv("SPL_DECIMALS", "6"))
@@ -60,7 +89,7 @@ PAYOUTS_COLL_PATH = f"{BASE_ACTIVITY_PATH}/payouts"
 PARTICIPANTS_COLL_PATH = f"{BASE_ACTIVITY_PATH}/participants"
 DRAWS_COLL_PATH = f"{BASE_ACTIVITY_PATH}/draws"
 CONFIG_DOC_PATH = f"{BASE_ACTIVITY_PATH}/config"
-PAYMENTS_COLL_PATH = f"{BASE_ACTIVITY_PATH}/payments"  # ← 新增：记录已用 paySig，防重放
+PAYMENTS_COLL_PATH = f"{BASE_ACTIVITY_PATH}/payments"  # 记录已用 paySig，防重放
 
 BATCH_LIMIT = int(os.getenv("PAYOUT_BATCH_LIMIT", "20"))
 SLEEP_BETWEEN_TX = float(os.getenv("PAYOUT_SLEEP", "0.5"))
@@ -73,11 +102,11 @@ DRAW_COST_UI = float(os.getenv("DRAW_COST_UI", "10000"))
 # Lottery Prize Table
 # -------------------------
 PRIZE_TABLE: List[Dict[str, Any]] = [
-    {"id": "mooncake", "label": "MOONcake", "type": "OFFCHAIN", "weight": 5},
-    {"id": "better-luck", "label": "Better luck next time", "type": "NONE", "weight": 70},
-    {"id": "moon-10k", "label": "10,000 $MOON", "type": "SPL", "amount": 10000, "weight": 20},
-    {"id": "moon-50k", "label": "50,000 $MOON", "type": "SPL", "amount": 50000, "weight": 3},
-    {"id": "moon-100k", "label": "100,000 $MOON", "type": "SPL", "amount": 100000, "weight": 2},
+    {"id": "mooncake",   "label": "MOONcake",                 "type": "OFFCHAIN", "weight": 5},
+    {"id": "better-luck","label": "Better luck next time",    "type": "NONE",     "weight": 70},
+    {"id": "moon-10k",   "label": "10,000 $MOON",             "type": "SPL",     "amount": 10000,  "weight": 20},
+    {"id": "moon-50k",   "label": "50,000 $MOON",             "type": "SPL",     "amount": 50000,  "weight": 3},
+    {"id": "moon-100k",  "label": "100,000 $MOON",            "type": "SPL",     "amount": 100000, "weight": 2},
 ]
 
 # -------------------------
@@ -104,9 +133,67 @@ def _require_db():
     return None
 
 # -------------------------
-# Bootstrap Solana client & treasury
+# Bootstrap Solana clients & treasury
 # -------------------------
-client = Client(RPC_ENDPOINT)
+def _build_clients() -> List[Client]:
+    out = []
+    for url in RPC_LIST:
+        try:
+            out.append(Client(url, timeout=RPC_TIMEOUT_SEC))
+        except Exception as e:
+            app.logger.warning(f"[RPC] create client failed for {url}: {e}")
+    return out
+
+CLIENTS: List[Client] = _build_clients()
+
+def _with_rpc_read(fn_name: str, *args, **kwargs):
+    """对只读 RPC（get_account_info / get_transaction / confirm）做多节点重试"""
+    last_err = None
+    for cli in CLIENTS:
+        try:
+            fn = getattr(cli, fn_name)
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last_err = e
+            app.logger.warning(f"[RPC READ] {fn_name} failed on {cli.endpoint_uri}: {e}")
+            continue
+    if last_err:
+        raise last_err
+    raise RuntimeError("no rpc clients available")
+
+def _with_rpc_send(tx: Transaction, *signers) -> str:
+    """发送交易：逐个 RPC 尝试，直到返回 signature；随后用 confirm 重试"""
+    last_err = None
+    for cli in CLIENTS:
+        try:
+            res = cli.send_transaction(tx, *signers, opts=TxOpts(skip_preflight=False))
+            sig = res.get("result") if isinstance(res, dict) else None
+            if not sig:
+                raise RuntimeError(f"send_transaction no signature: {res}")
+            # 确认也做重试
+            _rpc_confirm(sig)
+            return sig
+        except Exception as e:
+            last_err = e
+            app.logger.warning(f"[RPC SEND] send failed on {getattr(cli,'endpoint_uri','?')}: {e}")
+            continue
+    if last_err:
+        raise last_err
+    raise RuntimeError("no rpc clients available for send")
+
+def _rpc_confirm(signature: str):
+    """确认交易：多 RPC 重试（任一节点确认即视为成功）"""
+    last_err = None
+    for cli in CLIENTS:
+        try:
+            cli.confirm_transaction(signature)
+            return
+        except Exception as e:
+            last_err = e
+            app.logger.warning(f"[RPC CONFIRM] confirm failed on {cli.endpoint_uri}: {e}")
+            continue
+    if last_err:
+        raise last_err
 
 def _keypair_from_secret_bytes(secret_bytes: bytes) -> Keypair:
     # Keypair.from_secret_key expects 64-byte secret (ed25519 private key + public key)
@@ -197,13 +284,12 @@ def _mark_failed(item: PayoutItem, note: str):
 
 def _ensure_ata(owner: PublicKey, mint: PublicKey, payer: Keypair) -> PublicKey:
     ata = get_associated_token_address(owner, mint)
-    resp = client.get_account_info(ata)
+    resp = _with_rpc_read("get_account_info", ata)
     if resp.get("result", {}).get("value") is None:
         tx = Transaction()
         tx.add(create_associated_token_account(payer.public_key, owner, mint))
-        res = client.send_transaction(tx, payer, opts=TxOpts(skip_preflight=False))
-        sig = res.get("result")
-        client.confirm_transaction(sig)
+        sig = _with_rpc_send(tx, payer)
+        _rpc_confirm(sig)
     return ata
 
 def _send_spl(to_addr: str, ui_amount: float) -> str:
@@ -229,9 +315,8 @@ def _send_spl(to_addr: str, ui_amount: float) -> str:
             signers=None,
         )
     )
-    res = client.send_transaction(tx, treasury_kp, opts=TxOpts(skip_preflight=False))
-    sig = res.get("result")
-    client.confirm_transaction(sig)
+    sig = _with_rpc_send(tx, treasury_kp)
+    _rpc_confirm(sig)
     return sig
 
 def _weighted_choice(items: List[Dict[str, Any]], rnd: random.Random) -> Dict[str, Any]:
@@ -273,21 +358,23 @@ def _enqueue_payout(address: str, amount: float, note: Optional[str]):
     )
     return doc_ref.id
 
-# ---------- Payment validation helpers (NEW) ----------
+# ---------- Payment validation helpers ----------
 def _get_tx_json(signature: str) -> Optional[Dict[str, Any]]:
     """
     Try get_transaction (newer), then fall back to get_confirmed_transaction (older).
     Always request jsonParsed if available.
+    带多 RPC 重试。
     """
+    # 先试新版
     try:
-        resp = client.get_transaction(signature, commitment="confirmed", encoding="jsonParsed")
+        resp = _with_rpc_read("get_transaction", signature, commitment="confirmed", encoding="jsonParsed")
         if resp and resp.get("result"):
             return resp["result"]
     except Exception:
         pass
+    # 再试旧版
     try:
-        # Some clusters/versions: "get_confirmed_transaction"
-        resp = client.get_confirmed_transaction(signature, commitment="confirmed")
+        resp = _with_rpc_read("get_confirmed_transaction", signature, commitment="confirmed")
         if resp and resp.get("result"):
             return resp["result"]
     except Exception:
@@ -295,7 +382,7 @@ def _get_tx_json(signature: str) -> Optional[Dict[str, Any]]:
     return None
 
 def _is_pay_sig_used(sig: str) -> bool:
-    if db is None: 
+    if db is None:
         return False
     doc = db.document(f"{PAYMENTS_COLL_PATH}/{sig}").get()
     return doc.exists
@@ -394,7 +481,7 @@ def _validate_payment(pay_sig: str, wallet: str) -> Optional[str]:
             break
 
     if not found_ok:
-        # 进一步尝试从 pre/postTokenBalances 比对（可选增强）
+        # 可选增强：也可以从 pre/postTokenBalances 再对比一次
         return "tx_not_match_expected_payment"
 
     # 通过校验
@@ -405,25 +492,27 @@ def _validate_payment(pay_sig: str, wallet: str) -> Optional[str]:
 # -------------------------
 @app.get("/")
 def root():
+    # 取回退列表第一个作为“当前主用”回显
+    current_rpc = RPC_LIST[0] if RPC_LIST else RPC_PRIMARY
     return jsonify({
         "ok": True,
         "activity": ACTIVITY_ID,
         "treasury": str(TREASURY_PUB),
         "mint": MINT_ADDRESS,
-        "rpc": RPC_ENDPOINT,
+        "rpc": current_rpc,
         "profile": "real",
     })
 
 @app.get("/status")
 def status():
-    # 供前端读取 mint/decimals/treasury
+    current_rpc = RPC_LIST[0] if RPC_LIST else RPC_PRIMARY
     return jsonify({
         "ok": True,
         "activity": ACTIVITY_ID,
         "treasury": str(TREASURY_PUB),
         "mint": MINT_ADDRESS,
         "decimals": MINT_DECIMALS,
-        "rpc": RPC_ENDPOINT,
+        "rpc": current_rpc,
         "costUi": float(DRAW_COST_UI),
     })
 
@@ -479,7 +568,11 @@ def draw_once():
             return jsonify({"ok": False, "error": "draw limit reached", "count": cnt_total}), 403
 
     now_ms = int(time.time() * 1000)
-    salt = f"{ACTIVITY_ID}|{wallet}|{now_ms}|{client_seed}".encode("utf-8")
+    # 伪随机种子：加入可选 SERVER_SALT（不改变原有字段顺序，保持兼容）
+    salt_parts = [ACTIVITY_ID, wallet, str(now_ms), client_seed]
+    if SERVER_SALT:
+        salt_parts.append(SERVER_SALT)
+    salt = "|".join(salt_parts).encode("utf-8")
     seed_int = int(hashlib.sha256(salt).hexdigest(), 16)
     rnd = random.Random(seed_int)
 
@@ -590,9 +683,11 @@ def versions():
         "python": sys.version,
         "platform": platform.platform(),
         "env": {
-            "SOLANA_RPC": os.getenv("SOLANA_RPC"),
+            "SOLANA_RPC": RPC_PRIMARY,
+            "SOLANA_RPC_FALLBACKS": RPC_FALLBACKS_ENV,
             "GOOGLE_APPLICATION_CREDENTIALS": os.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
         },
+        "rpc_list": RPC_LIST,
         "checks": {},
     }
     for mod in [
@@ -674,15 +769,6 @@ def draws_latest():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
-
-
-
-
-
-
-
-
-
 
 
 
