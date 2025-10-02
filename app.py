@@ -463,7 +463,25 @@ def health():
 
 @app.get("/config")
 def get_config():
-    cfg = {
+    """
+    前端期望的扁平结构（关键对齐）：
+    {
+      ok, activity, mint, decimals, treasury, rpc, price, prizes, maxDrawsPerWallet
+    }
+    同时保留 {"config": {...}} 兼容旧前端。
+    """
+    flat = {
+        "activity": ACTIVITY_ID,
+        "mint": MINT_ADDRESS,
+        "decimals": MINT_DECIMALS,
+        "treasury": str(TREASURY_PUB),
+        "rpc": RPC_ENDPOINT,
+        "price": float(DRAW_COST_UI),            # 前端 PRICE_UI
+        "prizes": PRIZE_TABLE,
+        "maxDrawsPerWallet": MAX_DRAWS_PER_WALLET,
+        "profile": "real",
+    }
+    legacy = {
         "activity": ACTIVITY_ID,
         "mint": MINT_ADDRESS,
         "mintDecimals": MINT_DECIMALS,
@@ -472,14 +490,17 @@ def get_config():
         "prizes": PRIZE_TABLE,
         "drawCostUi": float(DRAW_COST_UI),
     }
+
+    # 快照到 Firestore（可选）
     if db is not None:
         try:
             db.document(CONFIG_DOC_PATH).set(
-                {**cfg, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True
+                {**flat, "updatedAt": firestore.SERVER_TIMESTAMP}, merge=True
             )
         except Exception as e:
             app.logger.warning(f"[CONFIG] Firestore snapshot failed: {e}")
-    return jsonify({"ok": True, "config": cfg})
+
+    return jsonify({"ok": True, **flat, "config": legacy})
 
 @app.post("/draw")
 def draw_once():
@@ -703,6 +724,8 @@ def draws_latest():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
+
 
 
 
