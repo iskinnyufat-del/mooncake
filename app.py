@@ -60,10 +60,14 @@ PAYOUTS_COLL_PATH = f"{BASE_ACTIVITY_PATH}/payouts"
 PARTICIPANTS_COLL_PATH = f"{BASE_ACTIVITY_PATH}/participants"
 DRAWS_COLL_PATH = f"{BASE_ACTIVITY_PATH}/draws"
 CONFIG_DOC_PATH = f"{BASE_ACTIVITY_PATH}/config"
+PAYMENTS_COLL_PATH = f"{BASE_ACTIVITY_PATH}/payments"  # ← 新增：记录已用 paySig，防重放
 
 BATCH_LIMIT = int(os.getenv("PAYOUT_BATCH_LIMIT", "20"))
 SLEEP_BETWEEN_TX = float(os.getenv("PAYOUT_SLEEP", "0.5"))
 MAX_DRAWS_PER_WALLET = int(os.getenv("MAX_DRAWS_PER_WALLET", "0"))
+
+# 付费抽奖金额（UI 单位），默认 10,000；可用 env 覆盖
+DRAW_COST_UI = float(os.getenv("DRAW_COST_UI", "10000"))
 
 # -------------------------
 # Lottery Prize Table
@@ -269,6 +273,133 @@ def _enqueue_payout(address: str, amount: float, note: Optional[str]):
     )
     return doc_ref.id
 
+# ---------- Payment validation helpers (NEW) ----------
+def _get_tx_json(signature: str) -> Optional[Dict[str, Any]]:
+    """
+    Try get_transaction (newer), then fall back to get_confirmed_transaction (older).
+    Always request jsonParsed if available.
+    """
+    try:
+        resp = client.get_transaction(signature, commitment="confirmed", encoding="jsonParsed")
+        if resp and resp.get("result"):
+            return resp["result"]
+    except Exception:
+        pass
+    try:
+        # Some clusters/versions: "get_confirmed_transaction"
+        resp = client.get_confirmed_transaction(signature, commitment="confirmed")
+        if resp and resp.get("result"):
+            return resp["result"]
+    except Exception:
+        pass
+    return None
+
+def _is_pay_sig_used(sig: str) -> bool:
+    if db is None: 
+        return False
+    doc = db.document(f"{PAYMENTS_COLL_PATH}/{sig}").get()
+    return doc.exists
+
+def _mark_pay_sig_used(sig: str, wallet: str, amount_ui: float):
+    if db is None:
+        return
+    db.document(f"{PAYMENTS_COLL_PATH}/{sig}").set(
+        {
+            "wallet": wallet,
+            "amount": float(amount_ui),
+            "mint": MINT_ADDRESS,
+            "decimals": MINT_DECIMALS,
+            "usedAt": firestore.SERVER_TIMESTAMP,
+        },
+        merge=True,
+    )
+
+def _validate_payment(pay_sig: str, wallet: str) -> Optional[str]:
+    """
+    Returns None if valid; otherwise returns error string.
+    Validation:
+      - tx exists & meta.err is None
+      - contains a Token Program 'transferChecked' instruction
+      - authority == wallet
+      - source == ATA(wallet, mint); destination == ATA(treasury, mint)
+      - mint == MINT_ADDRESS
+      - tokenAmount.decimals == MINT_DECIMALS and uiAmount == DRAW_COST_UI
+    """
+    if not pay_sig:
+        return "missing paySig"
+    if _is_pay_sig_used(pay_sig):
+        return "paySig already used"
+
+    if not MINT_ADDRESS:
+        return "server_mint_not_set"
+
+    tx = _get_tx_json(pay_sig)
+    if not tx:
+        return "tx_not_found"
+
+    meta = tx.get("meta") or {}
+    if meta.get("err") is not None:
+        return "tx_failed"
+
+    tx_msg = (tx.get("transaction") or {}).get("message") or {}
+    instrs = tx_msg.get("instructions") or []
+
+    # expected accounts
+    mint = MINT_ADDRESS
+    try:
+        mint_pk = PublicKey(mint)
+    except Exception:
+        return "server_mint_invalid"
+
+    try:
+        wallet_pk = PublicKey(wallet)
+    except Exception:
+        return "wallet_invalid"
+
+    source_ata = str(get_associated_token_address(wallet_pk, mint_pk))
+    dest_ata   = str(get_associated_token_address(TREASURY_PUB, mint_pk))
+
+    found_ok = False
+    # iterate over parsed instructions
+    for ix in instrs:
+        parsed = ix.get("parsed")
+        if not parsed:
+            continue
+        if parsed.get("type") != "transferChecked":
+            continue
+        info = parsed.get("info") or {}
+        # program check
+        program = ix.get("program")
+        program_id = ix.get("programId")
+        if not (program == "spl-token" or str(program_id) == str(TOKEN_PROGRAM_ID)):
+            continue
+
+        authority = info.get("authority")
+        src = info.get("source")
+        dst = info.get("destination")
+        ix_mint = info.get("mint")
+        token_amount = info.get("tokenAmount") or {}
+        ui_amount = float(token_amount.get("uiAmount") or 0)
+        decimals = int(token_amount.get("decimals") or 0)
+
+        if (
+            str(authority) == wallet
+            and str(src) == source_ata
+            and str(dst) == dest_ata
+            and str(ix_mint) == mint
+            and decimals == MINT_DECIMALS
+            and abs(ui_amount - float(DRAW_COST_UI)) < 1e-9
+        ):
+            found_ok = True
+            break
+
+    if not found_ok:
+        # 进一步尝试从 pre/postTokenBalances 比对（可选增强）
+        return "tx_not_match_expected_payment"
+
+    # 通过校验
+    return None
+
 # -------------------------
 # Endpoints
 # -------------------------
@@ -281,6 +412,19 @@ def root():
         "mint": MINT_ADDRESS,
         "rpc": RPC_ENDPOINT,
         "profile": "real",
+    })
+
+@app.get("/status")
+def status():
+    # 供前端读取 mint/decimals/treasury
+    return jsonify({
+        "ok": True,
+        "activity": ACTIVITY_ID,
+        "treasury": str(TREASURY_PUB),
+        "mint": MINT_ADDRESS,
+        "decimals": MINT_DECIMALS,
+        "rpc": RPC_ENDPOINT,
+        "costUi": float(DRAW_COST_UI),
     })
 
 @app.get("/health")
@@ -296,6 +440,7 @@ def get_config():
         "maxDrawsPerWallet": MAX_DRAWS_PER_WALLET,
         "profile": "real",
         "prizes": PRIZE_TABLE,
+        "drawCostUi": float(DRAW_COST_UI),
     }
     if db is not None:
         try:
@@ -311,15 +456,27 @@ def draw_once():
     body = request.get_json(force=True) if request.data else {}
     wallet_raw = (body.get("wallet") or "").strip()
     client_seed = (body.get("clientSeed") or "").strip()
+    pay_sig = (body.get("paySig") or "").strip() or None
 
     wallet = _safe_pubkey_str(wallet_raw)
     if not wallet:
         return jsonify({"ok": False, "error": "invalid wallet"}), 400
 
+    # 免费/付费判定（后端兜底）：第 1 次免费，之后必须提供有效 paySig
+    current_cnt = _count_wallet_draws(wallet)
+    need_pay = current_cnt >= 1
+
+    if need_pay:
+        err = _validate_payment(pay_sig or "", wallet)
+        if err is not None:
+            return jsonify({"ok": False, "error": f"payment_invalid:{err}"}), 400
+        # 标记 paySig 已用（幂等）
+        _mark_pay_sig_used(pay_sig, wallet, float(DRAW_COST_UI))
+
     if MAX_DRAWS_PER_WALLET > 0:
-        cnt = _count_wallet_draws(wallet)
-        if cnt >= MAX_DRAWS_PER_WALLET:
-            return jsonify({"ok": False, "error": "draw limit reached", "count": cnt}), 403
+        cnt_total = current_cnt
+        if cnt_total >= MAX_DRAWS_PER_WALLET:
+            return jsonify({"ok": False, "error": "draw limit reached", "count": cnt_total}), 403
 
     now_ms = int(time.time() * 1000)
     salt = f"{ACTIVITY_ID}|{wallet}|{now_ms}|{client_seed}".encode("utf-8")
@@ -337,6 +494,7 @@ def draw_once():
         "clientSeed": client_seed or None,
         "profile": "real",
         "timestamp": firestore.SERVER_TIMESTAMP if db is not None else None,
+        "paySig": pay_sig if need_pay else None,
     }
 
     payout_id = None
@@ -378,6 +536,7 @@ def draw_once():
         },
         "payoutId": payout_id,
         "serverTime": now_ms,
+        "needPay": need_pay,
     })
 
 @app.post("/payout/enqueue")
@@ -467,6 +626,7 @@ def import_debug():
         except Exception as e:
             data["modules"][mod] = {"error": str(e)}
     return jsonify(data)
+
 # 最近中奖名单：服务端读取 Firestore 并做轻筛选/脱敏
 @app.get("/draws/latest")
 def draws_latest():
@@ -514,6 +674,8 @@ def draws_latest():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
+
 
 
 
