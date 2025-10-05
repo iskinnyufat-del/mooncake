@@ -761,36 +761,9 @@ def draws_latest():
             wallet = d.get("wallet") or d.get("address")
             prize_label = d.get("prizeLabel") or (d.get("prize") or {}).get("label")
             ts = d.get("timestamp")
-           @app.get("/draws/latest")
-def draws_latest():
-    if db is None:
-        return jsonify({"ok": False, "error": "firestore_not_ready"}), 503
-    try:
-        try:
-            lim = int(request.args.get("limit", "5"))
-        except Exception:
-            lim = 5
-        lim = max(1, min(lim, 50))
-
-        qs = (
-            db.collection(DRAWS_COLL_PATH)
-              .order_by("timestamp", direction=firestore.Query.DESCENDING)
-              .limit(lim * 3)
-              .stream()
-        )
-
-        out = []
-        for docu in qs:
-            d = docu.to_dict() or {}
-            typ = str(d.get("type") or "").upper()
-            if typ == "NONE":
-                continue
-            wallet = d.get("wallet") or d.get("address")
-            prize_label = d.get("prizeLabel") or (d.get("prize") or {}).get("label")
-            ts = d.get("timestamp")
             out.append({
                 "wallet": wallet,
-                "prizeLabel": prize_label,
+                "prizeLabel": pr
                 "type": typ,
                 "timestamp": ts.isoformat() if ts else None,
             })
@@ -802,17 +775,10 @@ def draws_latest():
         app.logger.error(f"/draws/latest error: {e}")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-            if len(out) >= lim:
-                break
-
-        return jsonify({"ok": True, "draws": out})
-    except Exception as e:
-        app.logger.error(f"/draws/latest error: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
