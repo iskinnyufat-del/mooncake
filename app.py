@@ -66,22 +66,29 @@ def _read_text_file(path: str) -> Optional[str]:
 
 def _load_treasury_secret_from_str(secret: str) -> Keypair:
     """
-    Accepts: JSON array (Phantom export) or base58 string.
+    Accepts:
+      - JSON array (Phantom export)
+      - JSON string (e.g. the base58 wrapped with quotes)
+      - raw base58 string
     """
     if not secret:
         raise RuntimeError("SOLANA_TREASURY_SECRET_KEY not set and no file provided")
-    # JSON array
+
+    # Try parse as JSON first (to strip quotes or accept array)
     try:
-        arr = json.loads(secret)
-        if isinstance(arr, list):
-            b = bytes(arr)
+        parsed = json.loads(secret)
+        if isinstance(parsed, list):
+            b = bytes(parsed)
             if len(b) != 64:
                 raise ValueError("Invalid JSON secret key length (expect 64 bytes)")
             return Keypair.from_secret_key(b)
+        if isinstance(parsed, str):
+            secret = parsed  # remove surrounding quotes if any
     except json.JSONDecodeError:
         pass
-    # base58
-    raw = base58.b58decode(secret)
+
+    # Fallback: treat as base58 string
+    raw = base58.b58decode(secret.strip())
     if len(raw) != 64:
         raise ValueError("Invalid base58 secret key length (expect 64 bytes)")
     return Keypair.from_secret_key(raw)
@@ -89,7 +96,7 @@ def _load_treasury_secret_from_str(secret: str) -> Keypair:
 def _load_treasury_keypair() -> Keypair:
     """
     Load from file first (SOLANA_TREASURY_SECRET_FILE), else from env (SOLANA_TREASURY_SECRET_KEY).
-    File content can be JSON array or base58.
+    File content can be JSON array, JSON string, or base58.
     """
     secret_file = (os.getenv("SOLANA_TREASURY_SECRET_FILE") or "").strip()
     if secret_file:
@@ -121,7 +128,7 @@ PAYOUTS_COLL_PATH = f"{BASE_ACTIVITY_PATH}/payouts"
 PARTICIPANTS_COLL_PATH = f"{BASE_ACTIVITY_PATH}/participants"
 DRAWS_COLL_PATH = f"{BASE_ACTIVITY_PATH}/draws"
 CONFIG_DOC_PATH = f"{BASE_ACTIVITY_PATH}/config"
-PAYMENTS_COLL_PATH = f"{BASE_ACTIVITY_PATH}/payments"  # record used paySig to prevent replay
+PAYMENTS_COLL_PATH = f"{BASE_ACTIVITY_PATH}/payments"  # prevent paySig replay
 
 BATCH_LIMIT = int(os.getenv("PAYOUT_BATCH_LIMIT", "20"))
 SLEEP_BETWEEN_TX = float(os.getenv("PAYOUT_SLEEP", "0.5"))
@@ -379,8 +386,7 @@ def _validate_payment(pay_sig: str, wallet: str) -> Optional[str]:
       - source == ATA(wallet, mint); destination == ATA(treasury, mint)
       - mint == MINT_ADDRESS
       - tokenAmount.decimals == MINT_DECIMALS and uiAmount == DRAW_COST_UI
-
-    Added: retry up to 3 times (total 4 attempts) to tolerate RPC propagation delay.
+    Retry up to 3 times to tolerate RPC propagation delay.
     """
     if not pay_sig:
         return "missing paySig"
@@ -391,7 +397,6 @@ def _validate_payment(pay_sig: str, wallet: str) -> Optional[str]:
 
     _ensure_treasury_loaded()
 
-    # --- retry: 4 attempts (initial + 3 retries) with 0.8s sleep between ---
     tx = None
     for i in range(4):
         tx = _get_tx_json(pay_sig)
@@ -473,6 +478,11 @@ def root():
 
 @app.get("/status")
 def status():
+    # 强制尝试加载金库，便于排错
+    try:
+        _ensure_treasury_loaded()
+    except Exception as e:
+        app.logger.error(f"[STATUS] load treasury failed: {e}")
     tp = str(TREASURY_PUB) if TREASURY_PUB is not None else None
     return jsonify({
         "ok": True,
@@ -491,12 +501,13 @@ def health():
 @app.get("/config")
 def get_config():
     """
-    前端期望的扁平结构（关键对齐）：
-    {
-      ok, activity, mint, decimals, treasury, rpc, price, prizes, maxDrawsPerWallet, payoutMode, immediatePayout
-    }
-    同时保留 {"config": {...}} 兼容旧前端。
+    前端期望的扁平结构（关键字段对齐）+ 强加载金库。
     """
+    try:
+        _ensure_treasury_loaded()
+    except Exception as e:
+        app.logger.error(f"[CONFIG] load treasury failed: {e}")
+
     tp = str(TREASURY_PUB) if TREASURY_PUB is not None else None
     flat = {
         "activity": ACTIVITY_ID,
@@ -786,6 +797,8 @@ def draws_latest():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
+
 
 
 
