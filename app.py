@@ -130,6 +130,13 @@ MAX_DRAWS_PER_WALLET = int(os.getenv("MAX_DRAWS_PER_WALLET", "0"))
 # paid draw cost (UI units)
 DRAW_COST_UI = float(os.getenv("DRAW_COST_UI", "10000"))
 
+# ---- New: payout mode switches ----
+IMMEDIATE_PAYOUT = os.getenv("IMMEDIATE_PAYOUT", "").lower() in ("1", "true", "yes")
+PAYOUT_MODE = os.getenv("PAYOUT_MODE", "queue").strip().lower()  # "queue" | "immediate" | "hybrid"
+if IMMEDIATE_PAYOUT and PAYOUT_MODE == "queue":
+    # Keep backward-compat convenience switch
+    PAYOUT_MODE = "immediate"
+
 # -------------------------
 # Lottery Prize Table
 # -------------------------
@@ -275,6 +282,14 @@ def _send_spl(to_addr: str, ui_amount: float) -> str:
     sig = res.get("result")
     client.confirm_transaction(sig)
     return sig
+
+# ---- New: safe wrapper for immediate payout ----
+def _send_spl_safe(to_addr: str, ui_amount: float):
+    try:
+        sig = _send_spl(to_addr, ui_amount)
+        return True, sig, None
+    except Exception as e:
+        return False, None, str(e)
 
 def _weighted_choice(items: List[Dict[str, Any]], rnd: random.Random) -> Dict[str, Any]:
     weights = [max(0, int(it.get("weight", 0))) for it in items]
@@ -466,7 +481,7 @@ def get_config():
     """
     前端期望的扁平结构（关键对齐）：
     {
-      ok, activity, mint, decimals, treasury, rpc, price, prizes, maxDrawsPerWallet
+      ok, activity, mint, decimals, treasury, rpc, price, prizes, maxDrawsPerWallet, payoutMode, immediatePayout
     }
     同时保留 {"config": {...}} 兼容旧前端。
     """
@@ -480,6 +495,8 @@ def get_config():
         "prizes": PRIZE_TABLE,
         "maxDrawsPerWallet": MAX_DRAWS_PER_WALLET,
         "profile": "real",
+        "payoutMode": PAYOUT_MODE,
+        "immediatePayout": (PAYOUT_MODE == "immediate"),
     }
     legacy = {
         "activity": ACTIVITY_ID,
@@ -547,21 +564,57 @@ def draw_once():
     }
 
     payout_id = None
+    payout_tx = None  # 新增：即时发放的交易哈希
+
     if prize.get("type") == "SPL":
         if not MINT_ADDRESS:
             draw_doc["payoutEnqueued"] = False
             draw_doc["payoutError"] = "SPL_MINT not set"
-        elif db is None:
-            draw_doc["payoutEnqueued"] = False
-            draw_doc["payoutError"] = "firestore_not_ready"
         else:
-            try:
-                payout_id = _enqueue_payout(wallet, float(prize["amount"]), f"draw:{prize['id']}")
-                draw_doc["payoutEnqueued"] = True
-                draw_doc["payoutId"] = payout_id
-            except Exception as e:
-                draw_doc["payoutEnqueued"] = False
-                draw_doc["payoutError"] = str(e)
+            # 根据模式决定如何发放
+            mode = PAYOUT_MODE  # "queue" | "immediate" | "hybrid"
+            if mode == "immediate":
+                ok, sig, err = _send_spl_safe(wallet, float(prize["amount"]))
+                if ok and sig:
+                    payout_tx = sig
+                    draw_doc["payoutImmediate"] = True
+                    draw_doc["payoutTx"] = sig
+                    draw_doc["payoutEnqueued"] = False
+                else:
+                    draw_doc["payoutImmediate"] = False
+                    draw_doc["payoutError"] = err or "immediate payout failed"
+
+            elif mode == "hybrid":
+                ok, sig, err = _send_spl_safe(wallet, float(prize["amount"]))
+                if ok and sig:
+                    payout_tx = sig
+                    draw_doc["payoutImmediate"] = True
+                    draw_doc["payoutTx"] = sig
+                    draw_doc["payoutEnqueued"] = False
+                else:
+                    draw_doc["payoutImmediate"] = False
+                    draw_doc["payoutError"] = err or "immediate payout failed"
+                    if db is not None:
+                        try:
+                            payout_id = _enqueue_payout(wallet, float(prize["amount"]), f"draw:{prize['id']}")
+                            draw_doc["payoutEnqueued"] = True
+                            draw_doc["payoutId"] = payout_id
+                        except Exception as e:
+                            draw_doc["payoutEnqueued"] = False
+                            draw_doc["payoutError"] = f"{draw_doc.get('payoutError','')}; enqueue_failed:{e}"
+
+            else:  # "queue"（保持原有逻辑）
+                if db is None:
+                    draw_doc["payoutEnqueued"] = False
+                    draw_doc["payoutError"] = "firestore_not_ready"
+                else:
+                    try:
+                        payout_id = _enqueue_payout(wallet, float(prize["amount"]), f"draw:{prize['id']}")
+                        draw_doc["payoutEnqueued"] = True
+                        draw_doc["payoutId"] = payout_id
+                    except Exception as e:
+                        draw_doc["payoutEnqueued"] = False
+                        draw_doc["payoutError"] = str(e)
 
     if db is not None:
         try:
@@ -584,6 +637,7 @@ def draw_once():
             "amount": prize.get("amount"),
         },
         "payoutId": payout_id,
+        "payoutTx": payout_tx,   # 新增：即时发放成功时返回
         "serverTime": now_ms,
         "needPay": need_pay,
     })
@@ -709,7 +763,7 @@ def draws_latest():
             ts = d.get("timestamp")
             out.append({
                 "wallet": wallet,
-                "prizeLabel": prize_label,
+                "prizeLabel": pr
                 "type": typ,
                 "timestamp": ts.isoformat() if ts else None,
             })
@@ -724,6 +778,7 @@ def draws_latest():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
