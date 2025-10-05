@@ -130,11 +130,10 @@ MAX_DRAWS_PER_WALLET = int(os.getenv("MAX_DRAWS_PER_WALLET", "0"))
 # paid draw cost (UI units)
 DRAW_COST_UI = float(os.getenv("DRAW_COST_UI", "10000"))
 
-# ---- New: payout mode switches ----
+# ---- payout mode switches ----
 IMMEDIATE_PAYOUT = os.getenv("IMMEDIATE_PAYOUT", "").lower() in ("1", "true", "yes")
 PAYOUT_MODE = os.getenv("PAYOUT_MODE", "queue").strip().lower()  # "queue" | "immediate" | "hybrid"
 if IMMEDIATE_PAYOUT and PAYOUT_MODE == "queue":
-    # Keep backward-compat convenience switch
     PAYOUT_MODE = "immediate"
 
 # -------------------------
@@ -172,17 +171,20 @@ def _require_db():
     return None
 
 # -------------------------
-# Bootstrap Solana client & treasury
+# Solana client & treasury (LAZY LOAD)
 # -------------------------
 client = Client(RPC_ENDPOINT)
 
-try:
-    treasury_kp = _load_treasury_keypair()
-except Exception as e:
-    # Fail fast with clear error (so you see it immediately in logs)
-    raise RuntimeError(f"Load treasury keypair failed: {e}")
+treasury_kp: Optional[Keypair] = None
+TREASURY_PUB: Optional[PublicKey] = None
 
-TREASURY_PUB: PublicKey = treasury_kp.public_key
+def _ensure_treasury_loaded():
+    global treasury_kp, TREASURY_PUB
+    if treasury_kp is None or TREASURY_PUB is None:
+        kp = _load_treasury_keypair()  # 若环境变量未配置，此处才会抛错；导入阶段不抛
+        treasury_kp = kp
+        TREASURY_PUB = kp.public_key
+    return treasury_kp, TREASURY_PUB
 
 # -------------------------
 # Dataclass
@@ -259,6 +261,8 @@ def _ensure_ata(owner: PublicKey, mint: PublicKey, payer: Keypair) -> PublicKey:
 def _send_spl(to_addr: str, ui_amount: float) -> str:
     if not MINT_ADDRESS:
         raise RuntimeError("SPL_MINT not set.")
+    # 确保金库已加载
+    _ensure_treasury_loaded()
     mint_pk = PublicKey(MINT_ADDRESS)
     dest_owner = PublicKey(to_addr)
     dest_ata = _ensure_ata(dest_owner, mint_pk, treasury_kp)
@@ -283,7 +287,7 @@ def _send_spl(to_addr: str, ui_amount: float) -> str:
     client.confirm_transaction(sig)
     return sig
 
-# ---- New: safe wrapper for immediate payout ----
+# ---- safe wrapper for immediate payout ----
 def _send_spl_safe(to_addr: str, ui_amount: float):
     try:
         sig = _send_spl(to_addr, ui_amount)
@@ -385,6 +389,9 @@ def _validate_payment(pay_sig: str, wallet: str) -> Optional[str]:
     if not MINT_ADDRESS:
         return "server_mint_not_set"
 
+    # 需要金库公钥来验证目标 ATA
+    _ensure_treasury_loaded()
+
     tx = _get_tx_json(pay_sig)
     if not tx:
         return "tx_not_found"
@@ -451,10 +458,12 @@ def _validate_payment(pay_sig: str, wallet: str) -> Optional[str]:
 # -------------------------
 @app.get("/")
 def root():
+    # 这里不强制加载金库；没有就返回 None
+    tp = str(TREASURY_PUB) if TREASURY_PUB is not None else None
     return jsonify({
         "ok": True,
         "activity": ACTIVITY_ID,
-        "treasury": str(TREASURY_PUB),
+        "treasury": tp,
         "mint": MINT_ADDRESS,
         "rpc": RPC_ENDPOINT,
         "profile": "real",
@@ -462,10 +471,11 @@ def root():
 
 @app.get("/status")
 def status():
+    tp = str(TREASURY_PUB) if TREASURY_PUB is not None else None
     return jsonify({
         "ok": True,
         "activity": ACTIVITY_ID,
-        "treasury": str(TREASURY_PUB),
+        "treasury": tp,
         "mint": MINT_ADDRESS,
         "decimals": MINT_DECIMALS,
         "rpc": RPC_ENDPOINT,
@@ -485,11 +495,12 @@ def get_config():
     }
     同时保留 {"config": {...}} 兼容旧前端。
     """
+    tp = str(TREASURY_PUB) if TREASURY_PUB is not None else None
     flat = {
         "activity": ACTIVITY_ID,
         "mint": MINT_ADDRESS,
         "decimals": MINT_DECIMALS,
-        "treasury": str(TREASURY_PUB),
+        "treasury": tp,
         "rpc": RPC_ENDPOINT,
         "price": float(DRAW_COST_UI),            # 前端 PRICE_UI
         "prizes": PRIZE_TABLE,
@@ -564,7 +575,7 @@ def draw_once():
     }
 
     payout_id = None
-    payout_tx = None  # 新增：即时发放的交易哈希
+    payout_tx = None  # 即时发放时的链上哈希
 
     if prize.get("type") == "SPL":
         if not MINT_ADDRESS:
@@ -603,7 +614,7 @@ def draw_once():
                             draw_doc["payoutEnqueued"] = False
                             draw_doc["payoutError"] = f"{draw_doc.get('payoutError','')}; enqueue_failed:{e}"
 
-            else:  # "queue"（保持原有逻辑）
+            else:  # "queue"
                 if db is None:
                     draw_doc["payoutEnqueued"] = False
                     draw_doc["payoutError"] = "firestore_not_ready"
@@ -637,7 +648,7 @@ def draw_once():
             "amount": prize.get("amount"),
         },
         "payoutId": payout_id,
-        "payoutTx": payout_tx,   # 新增：即时发放成功时返回
+        "payoutTx": payout_tx,
         "serverTime": now_ms,
         "needPay": need_pay,
     })
@@ -718,7 +729,7 @@ def versions():
     info["gac_exists"] = os.path.exists(FIREBASE_CRED_PATH)
     info["mint"] = MINT_ADDRESS
     info["decimals"] = MINT_DECIMALS
-    info["treasury_pub"] = str(TREASURY_PUB)
+    info["treasury_pub"] = str(TREASURY_PUB) if TREASURY_PUB is not None else None
     return jsonify(info)
 
 @app.get("/import-debug")
@@ -763,7 +774,7 @@ def draws_latest():
             ts = d.get("timestamp")
             out.append({
                 "wallet": wallet,
-                "prizeLabel": pr
+                "prizeLabel": prize_label,
                 "type": typ,
                 "timestamp": ts.isoformat() if ts else None,
             })
@@ -778,6 +789,8 @@ def draws_latest():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
+
 
 
 
