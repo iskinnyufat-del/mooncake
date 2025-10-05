@@ -181,7 +181,7 @@ TREASURY_PUB: Optional[PublicKey] = None
 def _ensure_treasury_loaded():
     global treasury_kp, TREASURY_PUB
     if treasury_kp is None or TREASURY_PUB is None:
-        kp = _load_treasury_keypair()  # 若环境变量未配置，此处才会抛错；导入阶段不抛
+        kp = _load_treasury_keypair()  # load on demand
         treasury_kp = kp
         TREASURY_PUB = kp.public_key
     return treasury_kp, TREASURY_PUB
@@ -261,7 +261,6 @@ def _ensure_ata(owner: PublicKey, mint: PublicKey, payer: Keypair) -> PublicKey:
 def _send_spl(to_addr: str, ui_amount: float) -> str:
     if not MINT_ADDRESS:
         raise RuntimeError("SPL_MINT not set.")
-    # 确保金库已加载
     _ensure_treasury_loaded()
     mint_pk = PublicKey(MINT_ADDRESS)
     dest_owner = PublicKey(to_addr)
@@ -287,7 +286,6 @@ def _send_spl(to_addr: str, ui_amount: float) -> str:
     client.confirm_transaction(sig)
     return sig
 
-# ---- safe wrapper for immediate payout ----
 def _send_spl_safe(to_addr: str, ui_amount: float):
     try:
         sig = _send_spl(to_addr, ui_amount)
@@ -389,7 +387,6 @@ def _validate_payment(pay_sig: str, wallet: str) -> Optional[str]:
     if not MINT_ADDRESS:
         return "server_mint_not_set"
 
-    # 需要金库公钥来验证目标 ATA
     _ensure_treasury_loaded()
 
     tx = _get_tx_json(pay_sig)
@@ -458,7 +455,7 @@ def _validate_payment(pay_sig: str, wallet: str) -> Optional[str]:
 # -------------------------
 @app.get("/")
 def root():
-    # 这里不强制加载金库；没有就返回 None
+    # Do not force load here; show current state
     tp = str(TREASURY_PUB) if TREASURY_PUB is not None else None
     return jsonify({
         "ok": True,
@@ -471,6 +468,11 @@ def root():
 
 @app.get("/status")
 def status():
+    # proactively load treasury so frontend doesn't show "free draw only"
+    try:
+        _ensure_treasury_loaded()
+    except Exception as e:
+        app.logger.warning(f"[status] treasury not loaded: {e}")
     tp = str(TREASURY_PUB) if TREASURY_PUB is not None else None
     return jsonify({
         "ok": True,
@@ -488,13 +490,12 @@ def health():
 
 @app.get("/config")
 def get_config():
-    """
-    前端期望的扁平结构（关键对齐）：
-    {
-      ok, activity, mint, decimals, treasury, rpc, price, prizes, maxDrawsPerWallet, payoutMode, immediatePayout
-    }
-    同时保留 {"config": {...}} 兼容旧前端。
-    """
+    # proactively load treasury for UI
+    try:
+        _ensure_treasury_loaded()
+    except Exception as e:
+        app.logger.warning(f"[config] treasury not loaded: {e}")
+
     tp = str(TREASURY_PUB) if TREASURY_PUB is not None else None
     flat = {
         "activity": ACTIVITY_ID,
@@ -502,7 +503,7 @@ def get_config():
         "decimals": MINT_DECIMALS,
         "treasury": tp,
         "rpc": RPC_ENDPOINT,
-        "price": float(DRAW_COST_UI),            # 前端 PRICE_UI
+        "price": float(DRAW_COST_UI),
         "prizes": PRIZE_TABLE,
         "maxDrawsPerWallet": MAX_DRAWS_PER_WALLET,
         "profile": "real",
@@ -519,7 +520,6 @@ def get_config():
         "drawCostUi": float(DRAW_COST_UI),
     }
 
-    # 快照到 Firestore（可选）
     if db is not None:
         try:
             db.document(CONFIG_DOC_PATH).set(
@@ -575,14 +575,13 @@ def draw_once():
     }
 
     payout_id = None
-    payout_tx = None  # 即时发放时的链上哈希
+    payout_tx = None  # on-chain signature when immediate payout succeeds
 
     if prize.get("type") == "SPL":
         if not MINT_ADDRESS:
             draw_doc["payoutEnqueued"] = False
             draw_doc["payoutError"] = "SPL_MINT not set"
         else:
-            # 根据模式决定如何发放
             mode = PAYOUT_MODE  # "queue" | "immediate" | "hybrid"
             if mode == "immediate":
                 ok, sig, err = _send_spl_safe(wallet, float(prize["amount"]))
@@ -789,7 +788,6 @@ def draws_latest():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
-
 
 
 
