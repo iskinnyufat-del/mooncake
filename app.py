@@ -127,7 +127,7 @@ BASE_ACTIVITY_PATH = f"activities/{ACTIVITY_ID}"
 PAYOUTS_COLL_PATH = f"{BASE_ACTIVITY_PATH}/payouts"
 PARTICIPANTS_COLL_PATH = f"{BASE_ACTIVITY_PATH}/participants"
 DRAWS_COLL_PATH = f"{BASE_ACTIVITY_PATH}/draws"
-CONFIG_DOC_PATH = f"{BASE_ACTIVITY_PATH}/config"
+CONFIG_DOC_PATH = f"{BASE_ACTIVITY_PATH}/config/meta"
 PAYMENTS_COLL_PATH = f"{BASE_ACTIVITY_PATH}/payments"  # prevent paySig replay
 
 BATCH_LIMIT = int(os.getenv("PAYOUT_BATCH_LIMIT", "20"))
@@ -797,6 +797,8 @@ def draws_latest():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
+
 
 
 
