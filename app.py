@@ -181,7 +181,7 @@ TREASURY_PUB: Optional[PublicKey] = None
 def _ensure_treasury_loaded():
     global treasury_kp, TREASURY_PUB
     if treasury_kp is None or TREASURY_PUB is None:
-        kp = _load_treasury_keypair()  # load on demand
+        kp = _load_treasury_keypair()  # load only when needed
         treasury_kp = kp
         TREASURY_PUB = kp.public_key
     return treasury_kp, TREASURY_PUB
@@ -379,6 +379,8 @@ def _validate_payment(pay_sig: str, wallet: str) -> Optional[str]:
       - source == ATA(wallet, mint); destination == ATA(treasury, mint)
       - mint == MINT_ADDRESS
       - tokenAmount.decimals == MINT_DECIMALS and uiAmount == DRAW_COST_UI
+
+    Added: retry up to 3 times (total 4 attempts) to tolerate RPC propagation delay.
     """
     if not pay_sig:
         return "missing paySig"
@@ -389,7 +391,15 @@ def _validate_payment(pay_sig: str, wallet: str) -> Optional[str]:
 
     _ensure_treasury_loaded()
 
-    tx = _get_tx_json(pay_sig)
+    # --- retry: 4 attempts (initial + 3 retries) with 0.8s sleep between ---
+    tx = None
+    for i in range(4):
+        tx = _get_tx_json(pay_sig)
+        if tx:
+            break
+        if i < 3:
+            time.sleep(0.8)
+
     if not tx:
         return "tx_not_found"
 
@@ -402,13 +412,9 @@ def _validate_payment(pay_sig: str, wallet: str) -> Optional[str]:
 
     try:
         mint_pk = PublicKey(MINT_ADDRESS)
-    except Exception:
-        return "server_mint_invalid"
-
-    try:
         wallet_pk = PublicKey(wallet)
     except Exception:
-        return "wallet_invalid"
+        return "wallet_or_mint_invalid"
 
     source_ata = str(get_associated_token_address(wallet_pk, mint_pk))
     dest_ata   = str(get_associated_token_address(TREASURY_PUB, mint_pk))
@@ -455,7 +461,6 @@ def _validate_payment(pay_sig: str, wallet: str) -> Optional[str]:
 # -------------------------
 @app.get("/")
 def root():
-    # Do not force load here; show current state
     tp = str(TREASURY_PUB) if TREASURY_PUB is not None else None
     return jsonify({
         "ok": True,
@@ -468,11 +473,6 @@ def root():
 
 @app.get("/status")
 def status():
-    # proactively load treasury so frontend doesn't show "free draw only"
-    try:
-        _ensure_treasury_loaded()
-    except Exception as e:
-        app.logger.warning(f"[status] treasury not loaded: {e}")
     tp = str(TREASURY_PUB) if TREASURY_PUB is not None else None
     return jsonify({
         "ok": True,
@@ -490,12 +490,13 @@ def health():
 
 @app.get("/config")
 def get_config():
-    # proactively load treasury for UI
-    try:
-        _ensure_treasury_loaded()
-    except Exception as e:
-        app.logger.warning(f"[config] treasury not loaded: {e}")
-
+    """
+    前端期望的扁平结构（关键对齐）：
+    {
+      ok, activity, mint, decimals, treasury, rpc, price, prizes, maxDrawsPerWallet, payoutMode, immediatePayout
+    }
+    同时保留 {"config": {...}} 兼容旧前端。
+    """
     tp = str(TREASURY_PUB) if TREASURY_PUB is not None else None
     flat = {
         "activity": ACTIVITY_ID,
@@ -551,9 +552,8 @@ def draw_once():
             return jsonify({"ok": False, "error": f"payment_invalid:{err}"}), 400
         _mark_pay_sig_used(pay_sig, wallet, float(DRAW_COST_UI))
 
-    if MAX_DRAWS_PER_WALLET > 0:
-        if current_cnt >= MAX_DRAWS_PER_WALLET:
-            return jsonify({"ok": False, "error": "draw limit reached", "count": current_cnt}), 403
+    if MAX_DRAWS_PER_WALLET > 0 and current_cnt >= MAX_DRAWS_PER_WALLET:
+        return jsonify({"ok": False, "error": "draw limit reached", "count": current_cnt}), 403
 
     now_ms = int(time.time() * 1000)
     salt = f"{ACTIVITY_ID}|{wallet}|{now_ms}|{client_seed}".encode("utf-8")
@@ -575,7 +575,7 @@ def draw_once():
     }
 
     payout_id = None
-    payout_tx = None  # on-chain signature when immediate payout succeeds
+    payout_tx = None  # tx hash for immediate payout
 
     if prize.get("type") == "SPL":
         if not MINT_ADDRESS:
@@ -593,7 +593,6 @@ def draw_once():
                 else:
                     draw_doc["payoutImmediate"] = False
                     draw_doc["payoutError"] = err or "immediate payout failed"
-
             elif mode == "hybrid":
                 ok, sig, err = _send_spl_safe(wallet, float(prize["amount"]))
                 if ok and sig:
@@ -612,7 +611,6 @@ def draw_once():
                         except Exception as e:
                             draw_doc["payoutEnqueued"] = False
                             draw_doc["payoutError"] = f"{draw_doc.get('payoutError','')}; enqueue_failed:{e}"
-
             else:  # "queue"
                 if db is None:
                     draw_doc["payoutEnqueued"] = False
@@ -788,6 +786,7 @@ def draws_latest():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
